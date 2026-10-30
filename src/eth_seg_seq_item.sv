@@ -1,6 +1,7 @@
 // src 事务层：以字节而非总线宽度表示报文，使同一 sequence 可运行于三种速率。
 // sequence、driver、monitor 各拥有独立深拷贝；frame_bytes 默认从 DA 开始，包含配置要求的 FCS。
 // 位置字段负一表示未指定/尚未观察，注入字段与观察字段并存以保留错误测试意图。
+// gap_segments 是本帧 EOP 之后的最小有效 idle 段数；无效拍不消费间隔，与负载间隔取最大值。
 class eth_seg_seq_item extends uvm_sequence_item;
   `uvm_object_utils(eth_seg_seq_item)
 

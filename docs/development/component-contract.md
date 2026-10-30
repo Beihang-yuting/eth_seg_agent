@@ -29,3 +29,20 @@
 - 默认数据不包含FCS；include_fcs启用后monitor保留尾4B。`fcs_present`显式区分自动生成与已提供，不以CRC是否0判断。
 - 原始接口中的PAD不能从任意EtherType payload无损猜测删除；默认合法sequence生成至少60B的DA到payload数据，不引入隐式PAD；接真实MAC时应用层保留收到的padding或自行按协议长度解释。
 - 验证为VIP自检和独立pin级检查，未提供厂商F-Tile RTL，不能声称已验证真实IP。
+
+## 时序边界约定
+
+- TX ready 必须使用 `tx_cb` 的正沿采样值形成历史，再在负沿驱动 valid；在正沿观察到的
+  `valid[t] = ready[t-2]`，不依赖 DUT 在正沿还是负沿更新 ready。
+- `gap_segments` 表示本帧后最小有效 idle segment 数；TX/RX 都逐段消费，同拍 EOP 后也要
+  先完成间隔才能发送下一个 SOP。ready/valid 气泡既不消费报文字节，也不消费间隔。
+- 配置统一通过 `gap_after_frame(frame_segments, minimum_gap)` 计算间隔。固定负载使用
+  `traffic_load_pct`；`random_load=1` 时每帧独立从 `load_min_pct..load_max_pct` 选择百分比，
+  不受固定负载默认 100 限制。间隔为 `max(minimum_gap, ceil(frame_segments*(100-pct)/pct))`。
+- 负载定义是客户端接口可用有效 segment 中的数据段占比上限，按段取整；外部 ready/RX
+  valid 气泡、报文来源饥饿、显式最小间隔还会降低实际吞吐，不等同于物理链路 Gbit/s 保证。
+- checker 对 valid 为 X/Z 报错；valid=0 时 RX 全部字段不参与检查。valid=1 时仅检查
+  包内有效数据字节，RX 状态/empty 只在 EOP 检查，idle 段和 EOP 未使用字节允许未知。
+  TX valid=0 时全部输出保持的原规则不变。
+
+定向覆盖与审查记录见 [时序审查](timing-audit.md)。

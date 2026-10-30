@@ -1,6 +1,7 @@
 // src TX 驱动层：把字节事务切成并行 64-bit segments，并实现 ready→valid 两拍延迟。
-// prefetch 线程在 item_done 时仅转移深拷贝；驱动线程在负沿更新私有代理，完成线程在正沿
-// 采样 EOP 后发布 sent_ap，保证 sequence 完成与物理发送完成语义分离。
+// prefetch 线程在 item_done 时仅转移深拷贝；ready 线程按正沿 clocking 采样，驱动线程在
+// 负沿更新私有代理，完成线程在正沿采样 EOP 后发布 sent_ap。各线程只借用 cfg/vif。
+// ready 历史由采样线程拥有；pending/active/encoded 是 driver 独占的事务副本与编码状态。
 class eth_seg_tx_driver #(int RATE = 100) extends uvm_driver #(eth_seg_seq_item);
   `uvm_component_param_utils(eth_seg_tx_driver#(RATE))
   localparam int NUM_SEGMENTS = RATE/25;
@@ -12,7 +13,7 @@ class eth_seg_tx_driver #(int RATE = 100) extends uvm_driver #(eth_seg_seq_item)
   eth_seg_seq_item active;
   eth_seg_byte_queue_t encoded;
   int byte_ptr = 0;
-  int idle_left = 0;
+  int idle_left = 0; // 尚需发送的有效 idle segment 数，不是时钟周期数。
   bit have_active = 0;
   bit ready_d1 = 0, ready_d2 = 0;
 
@@ -43,10 +44,21 @@ class eth_seg_tx_driver #(int RATE = 100) extends uvm_driver #(eth_seg_seq_item)
     end
   endtask
 
-  // 将当前 packet 的若干 segment 组合到私有代理；EOP 后允许同拍拉取下一个包的 SOP。
+  // 从统一正沿采样点保存 ready 历史，隔离 DUT 在正沿或负沿更新输出的差别。
+  // 正沿 t 更新 d2=ready[t-1]，随后负沿驱动它，正沿 t+1 才被采样，即固定两拍。
+  // 使用 input #1step 的 clocking 值，避免与 DUT 的同沿 NBA 输出产生调度竞争。
+  task sample_ready_thread();
+    forever begin
+      @(cfg.vif.tx_cb);
+      if (!cfg.vif.tx_cb.i_tx_rst_n) begin ready_d1 = 0; ready_d2 = 0; end
+      else begin ready_d2 = ready_d1; ready_d1 = cfg.vif.tx_cb.o_tx_mac_ready; end
+    end
+  endtask
+
+  // 将当前 packet 的若干 segment 组合到私有代理；EOP 后满足包间隔即可在同拍开始下一包。
   // data 和所有边带在 valid=0 时保持上一次值，valid 仅由两拍 ready 历史决定。
   task drive_thread();
-    bit current_ready, next_valid, cycle_idle;
+    bit next_valid;
     forever begin
       @(negedge cfg.vif.i_clk_tx);
       if (!cfg.vif.i_tx_rst_n) begin
@@ -56,21 +68,14 @@ class eth_seg_tx_driver #(int RATE = 100) extends uvm_driver #(eth_seg_seq_item)
         cfg.vif.drv_tx_eop_empty <= '0;
         cfg.vif.drv_tx_error <= '0;
         cfg.vif.drv_tx_skip_crc <= '0;
-        ready_d1 = 0; ready_d2 = 0;
         active = null; have_active = 0; byte_ptr = 0;
         idle_left = 0;
         encoded.delete(); done_q.delete(); pending.delete();
         continue;
       end
-      current_ready = cfg.vif.o_tx_mac_ready;
-      // 两级历史分别保存上一拍和上两拍 ready；阻塞赋值让本次计算使用旧 d1，
-      // 从而在下一个正沿得到 ready[t-1]，即相对采样正沿完整两拍延迟。
-      ready_d2 = ready_d1;
-      ready_d1 = current_ready;
       next_valid = ready_d2;
       cfg.vif.drv_tx_valid <= next_valid;
       if (!next_valid) continue;
-      cycle_idle = 0;
       cfg.vif.drv_tx_data <= cfg.vif.drv_tx_data;
       cfg.vif.drv_tx_inframe <= cfg.vif.drv_tx_inframe;
       cfg.vif.drv_tx_eop_empty <= cfg.vif.drv_tx_eop_empty;
@@ -107,11 +112,8 @@ class eth_seg_tx_driver #(int RATE = 100) extends uvm_driver #(eth_seg_seq_item)
               sent.frame_bytes[k] = encoded[k + (cfg.preamble_passthrough ? 8 : 0)];
             sent.fcs_present = cfg.include_fcs;
             done_q.push_back(sent);
+            idle_left = cfg.gap_after_frame((encoded.size()+7)/8, active.gap_segments);
             active = null; have_active = 0; encoded.delete(); byte_ptr = 0;
-            if (cfg.traffic_load_pct < 100) begin
-              int pct = cfg.random_load ? $urandom_range(cfg.load_min_pct,cfg.load_max_pct) : cfg.traffic_load_pct;
-              idle_left = (pct >= 100) ? 0 : $urandom_range(0, (100-pct)/10 + 1);
-            end
           end
         end else begin
           // valid 仍由 ready 历史决定；包间节流以空闲 segment 表示，绝不改写 valid。
@@ -119,10 +121,9 @@ class eth_seg_tx_driver #(int RATE = 100) extends uvm_driver #(eth_seg_seq_item)
           cfg.vif.drv_tx_eop_empty[s*3 +: 3] <= 3'd0;
           cfg.vif.drv_tx_error[s] <= 1'b0;
           cfg.vif.drv_tx_skip_crc[s] <= 1'b0;
-          if (idle_left > 0) cycle_idle = 1'b1;
+          if (idle_left > 0) idle_left--;
         end
       end
-      if (cycle_idle && idle_left > 0) idle_left--;
     end
   endtask
 
@@ -153,6 +154,7 @@ class eth_seg_tx_driver #(int RATE = 100) extends uvm_driver #(eth_seg_seq_item)
     cfg.vif.claim_tx(get_full_name());
     fork
       prefetch_thread();
+      sample_ready_thread();
       drive_thread();
       completion_thread();
     join_none

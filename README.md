@@ -17,10 +17,17 @@ make compile RATE=100
 make run RATE=200 TEST=eth_seg_smoke_test SEED=7
 make regress
 make bind-test SEED=7
+make timing-test SEED=7
+make timing-checker-test
 ```
 
 日志位于 `build/<RATE>/logs/`，`scripts/check_log.py` 检查 UVM summary 和非零错误计数。
-当前 testbench 是双 active VIP 自检，不包含厂商 F-Tile 加密 RTL 模型。
+原 smoke testbench 是双 active VIP 自检；新增时序测试使用独立 HDL ready 源，均不包含厂商 F-Tile 加密 RTL 模型。
+
+`gap_segments` / sequence 的 `inter_frame_gap` 以有效 idle segment 计数，TX/RX 均执行。
+固定/随机负载按每帧占用的 segment 数换算间隔，外部 ready/valid 气泡不消费该计数。
+真实 DUT 正沿更新 ready、包内停顿、复位恢复及 checker 字段有效范围见
+[时序审查与定向回归](docs/development/timing-audit.md)。
 
 接入真实 DUT 时，配置必须使用与接口参数一致的句柄类型，例如
 `uvm_config_db#(virtual eth_seg_if#(200))::set(null, "uvm_test_top", "vif", vif200)`；

@@ -38,9 +38,38 @@ NET_AIP_SRC := $(AIP_CORE)/aip_core_pkg.sv $(NET_SRC) \
                checker/eth_seg_protocol_checker.sv bind/eth_seg_bind_wrapper.sv \
                examples/aip/eth_net_packet_aip_pkg.sv test/net_packet/eth_net_packet_test_pkg.sv \
                test/net_packet/eth_net_packet_aip_test_pkg.sv test/net_packet/tb_net_packet_aip.sv
+TIMING_SRC := rtl/eth_seg_if.sv src/eth_seg_types.sv src/eth_seg_pkg.sv \
+              checker/eth_seg_protocol_checker.sv test/timing/eth_timing_control.sv \
+              test/timing/eth_timing_test_pkg.sv test/timing/tb_timing.sv
+SCENARIO ?= all
 
 .PHONY: compile run regress clean bind-test bind-run aip-test aip-run \
-        net-packet-test net-packet-run net-packet-aip-test net-packet-aip-run
+        net-packet-test net-packet-run net-packet-aip-test net-packet-aip-run timing-test timing-run \
+        timing-checker-test timing-checker-run
+
+timing-checker-test:
+	$(MAKE) --no-print-directory timing-checker-run BUILD=build/timing_checker
+
+# 非法 X/Z 用例按精确诊断判通过，不能套用普通测试的零 error 规则。
+timing-checker-run:
+	mkdir -p $(BUILD)/logs $(BUILD)/csrc
+	$(VCS) -full64 -sverilog -timescale=1ns/1ps -top tb_timing_checker -Mdir=$(BUILD)/csrc -o $(SIMV) checker/eth_seg_protocol_checker.sv test/timing/tb_timing_checker.sv -l $(BUILD)/logs/compile.log
+	python3 scripts/check_log.py $(BUILD)/logs/compile.log compile
+	@for scenario in rx_invalid rx_z rx_dontcare rx_eop_x rx_data_x tx_dontcare tx_data_x; do \
+		$(SIMV) +CASE=$$scenario -l $(BUILD)/logs/$$scenario.log; \
+		python3 scripts/check_timing_checker.py $(BUILD)/logs/$$scenario.log $$scenario || exit $$?; \
+	done
+
+timing-test:
+	$(MAKE) --no-print-directory timing-run BUILD=build/timing
+
+# SCENARIO 可单独选择 ready/gap/load/random_load/reset；默认运行全部阶段。
+timing-run:
+	mkdir -p $(BUILD)/logs $(BUILD)/csrc
+	$(VCS) $(VCSFLAGS) -top tb_timing $(TIMING_SRC) -l $(BUILD)/logs/compile.log
+	python3 scripts/check_log.py $(BUILD)/logs/compile.log compile
+	$(SIMV) +SCENARIO=$(SCENARIO) +ntb_random_seed=$(SEED) -l $(BUILD)/logs/timing_$(SCENARIO).log
+	python3 scripts/check_log.py $(BUILD)/logs/timing_$(SCENARIO).log run ETH_TIMING_TEST_COMPLETE
 
 net-packet-test:
 	$(MAKE) --no-print-directory net-packet-run BUILD=build/net_packet

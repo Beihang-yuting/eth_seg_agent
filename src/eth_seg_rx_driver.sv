@@ -2,6 +2,7 @@
 // 负沿更新 RX 私有代理；valid 低时不消费字节，故周期/随机节奏只插入有效气泡，
 // 包内状态跨气泡保存。EOP 在正沿真正采样后通过 sent_ap 发布。
 // 有效拍尾部没有下一包的 segment 必须显式置 idle，避免上拍 inframe 留下伪 SOP。
+// cfg/vif 由 agent 拥有，本 driver 借用；排队/活动事务、编码队列和间隔计数归本组件。
 class eth_seg_rx_driver #(int RATE = 100) extends uvm_driver #(eth_seg_seq_item);
   `uvm_component_param_utils(eth_seg_rx_driver#(RATE))
   localparam int NUM_SEGMENTS = RATE/25;
@@ -11,7 +12,7 @@ class eth_seg_rx_driver #(int RATE = 100) extends uvm_driver #(eth_seg_seq_item)
   int unsigned packets_sent = 0;
   eth_seg_seq_item pending[$], done_q[$], active;
   eth_seg_byte_queue_t encoded;
-  int byte_ptr = 0, idle_left = 0, cycle_count = 0;
+  int byte_ptr = 0, idle_left = 0, cycle_count = 0; // idle_left 单位是有效 segment。
   bit have_active = 0;
 
   // 创建分析端口；RX 发送完成与 TX 相同，基于引脚 EOP 采样而非 item_done。
@@ -39,7 +40,7 @@ class eth_seg_rx_driver #(int RATE = 100) extends uvm_driver #(eth_seg_seq_item)
   endtask
 
   // 依照 rx_valid_pattern 产生有效拍；traffic_load_pct 只在包间 idle segment 节流。
-  // 一个有效周期最多输出 NUM_SEGMENTS 段，EOP 后剩余段可立刻承载下一包 SOP；
+  // 一个有效周期最多输出 NUM_SEGMENTS 段，EOP 后满足包间隔的剩余段可承载下一包 SOP；
   // 若没有下一包则清空这些段的边界标记，不能把上一拍的数据段解释成新报文。
   task drive_thread();
     bit send_valid;
@@ -62,13 +63,13 @@ class eth_seg_rx_driver #(int RATE = 100) extends uvm_driver #(eth_seg_seq_item)
         end
         ETH_SEG_RANDOM: send_valid = ($urandom_range(0,99) < cfg.rx_valid_high_pct);
       endcase
-      if (idle_left > 0 && !have_active) begin send_valid = 0; idle_left--; end
-      // RX 没有待发事务时不产生伪造 valid；有事务后 pattern 再决定包内气泡。
-      if (!have_active && pending.size() == 0) send_valid = 0;
+      // 包间隔通过 valid 拍中的 idle segment 表示；气泡既不消费字节也不消费间隔。
+      // 无报文且没有剩余间隔才停止 valid，避免末包间隔永久挂起到下一次发包。
+      if (!have_active && pending.size() == 0 && idle_left == 0) send_valid = 0;
       cfg.vif.drv_rx_valid <= send_valid;
       if (!send_valid) continue;
       for (int s = 0; s < NUM_SEGMENTS; s++) begin
-        if (!have_active && pending.size() != 0) begin
+        if (!have_active && idle_left == 0 && pending.size() != 0) begin
           active = pending.pop_front();
           if (active.frame_bytes.size() < 9) begin `uvm_error("ETH_RX_LEN", "RX frame must contain at least 9 bytes"); active.aborted = 1; end
           eth_seg_codec::encode(active, cfg.preamble_passthrough, cfg.include_fcs, encoded);
@@ -93,11 +94,8 @@ class eth_seg_rx_driver #(int RATE = 100) extends uvm_driver #(eth_seg_seq_item)
               sent.frame_bytes[k] = encoded[k + (cfg.preamble_passthrough ? 8 : 0)];
             sent.fcs_present = cfg.include_fcs;
             done_q.push_back(sent);
+            idle_left = cfg.gap_after_frame((encoded.size()+7)/8, active.gap_segments);
             active = null; have_active = 0; encoded.delete(); byte_ptr = 0;
-            if (cfg.traffic_load_pct < 100) begin
-              int pct = cfg.random_load ? $urandom_range(cfg.load_min_pct,cfg.load_max_pct) : cfg.traffic_load_pct;
-              idle_left = (pct >= 100) ? 0 : $urandom_range(0, (100-pct)/10 + 1);
-            end
           end
         end else begin
           // o_rx_mac_valid 对整拍生效，尾部空段同样会被接收方检查 inframe。
@@ -108,6 +106,7 @@ class eth_seg_rx_driver #(int RATE = 100) extends uvm_driver #(eth_seg_seq_item)
           cfg.vif.drv_rx_fcs_error[s] <= 1'b0;
           cfg.vif.drv_rx_error[s*2 +: 2] <= '0;
           cfg.vif.drv_rx_status_data[s*3 +: 3] <= '0;
+          if (idle_left > 0) idle_left--;
         end
       end
     end

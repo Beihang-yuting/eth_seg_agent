@@ -1,4 +1,5 @@
-// 基础 sequence：提供确定性/随机报文构造和错误字段入口，发送完成语义由 driver sent_ap 决定。
+// seq_lib 基础 sequence：提供确定性/随机报文构造和错误字段入口，依赖 eth_seg_pkg 的事务/codec。
+// sequence 拥有生成的事务，driver 在 item_done 前深拷贝；物理完成语义由 sent_ap 决定。
 // 本类只操作字节事务，不假设 RATE；因此同一 sequence 可用于 100/200/400G agent。
 class eth_seg_base_seq extends uvm_sequence #(eth_seg_seq_item);
   `uvm_object_utils(eth_seg_base_seq)
@@ -10,8 +11,9 @@ class eth_seg_base_seq extends uvm_sequence #(eth_seg_seq_item);
   bit inject_fcs_error = 0;
   bit inject_error = 0;
   bit random_length = 1;
-  int unsigned inter_frame_gap = 0;
+  int unsigned inter_frame_gap = 0; // 写入 item.gap_segments，单位是包后有效 idle segment。
 
+  // 初始化 sequence 身份；报文字节在 body 中按所选长度创建。
   function new(string name = "eth_seg_base_seq");
     super.new(name);
   endfunction

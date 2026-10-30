@@ -24,6 +24,30 @@ class eth_seg_config #(int RATE = 100) extends uvm_object;
     super.new(name);
   endfunction
 
+  // 将本帧占用的有效 segment 数换算为包后 idle 段数，供 TX/RX 共用同一负载定义。
+  // 随机模式每帧选一次百分比，独立于固定 traffic_load_pct；向上取整使目标负载为上限。
+  // 显式 gap_segments 是最小间隔，与负载间隔取较大者；ready/valid 气泡不消费这些段。
+  // 返回值由 driver 倒计数；负数输入/溢出明确 fatal，避免错误间隔变成无限等待。
+  function int gap_after_frame(input int unsigned frame_segments, input int minimum_gap);
+    int pct;
+    longint unsigned load_gap;
+    if (minimum_gap < 0) begin
+      `uvm_fatal("ETH_SEG_GAP", "gap_segments must be nonnegative")
+      return 0;
+    end
+    pct = random_load ? $urandom_range(load_max_pct, load_min_pct) : traffic_load_pct;
+    if (pct < 1 || pct > 100) begin
+      `uvm_fatal("ETH_SEG_LOAD", "load percentage must be 1..100")
+      return 0;
+    end
+    load_gap = (longint'(frame_segments) * (100-pct) + pct-1) / pct;
+    if (load_gap > 32'h7fffffff) begin
+      `uvm_fatal("ETH_SEG_GAP", "computed gap exceeds supported segment count")
+      return 0;
+    end
+    return (load_gap > minimum_gap) ? int'(load_gap) : minimum_gap;
+  endfunction
+
   // 校验全部静态约束并返回首个原因；不发 report，调用者决定 fatal 的组件上下文。
   function bit validate(output string reason);
     reason = "";
