@@ -1,5 +1,6 @@
 // Agent 层：按 CLIENT/MAC 角色组合发送、接收和 ready 驱动，同时始终保留双向 monitor。
-// 配置对象由父 env 通过成员或 config_db 预置；active 角色只申请自己拥有的引脚驱动权。
+// 配置由 env 或 bind module 预置；active 角色只申请自己拥有的引脚驱动权。
+// agent 拥有 driver/monitor/sequencer，connect 自动发布静态 sqr，final 撤销借用记录。
 class eth_seg_agent #(int RATE = 100) extends uvm_agent;
   `uvm_component_param_utils(eth_seg_agent#(RATE))
 
@@ -51,7 +52,8 @@ class eth_seg_agent #(int RATE = 100) extends uvm_agent;
     end
   endfunction
 
-  // 连接发送 sequencer；MAC 的 RX 与 ready 驱动不使用 sequencer，直接消费配置节奏。
+  // CLIENT TX / MAC RX 连接各自 sequencer；ready 独立按配置运行。
+  // 发布到非参数化静态表后，Tcl 可按 agent 名字直接启动，无需顶层 env 转接。
   function void connect_phase(uvm_phase phase);
     super.connect_phase(phase);
     if (cfg != null && cfg.is_active == UVM_ACTIVE) begin
@@ -59,6 +61,13 @@ class eth_seg_agent #(int RATE = 100) extends uvm_agent;
         tx_driver.seq_item_port.connect(sequencer.seq_item_export);
       else if (cfg.role == ETH_SEG_MAC && rx_driver != null)
         rx_driver.seq_item_port.connect(sequencer.seq_item_export);
+      eth_seg_sequencer::register_sqr(get_full_name(), sequencer);
     end
+  endfunction
+
+  // UVM 结束时清除本 agent 的静态索引；组件对象仍由 UVM 管理生命周期。
+  function void final_phase(uvm_phase phase);
+    super.final_phase(phase);
+    if (sequencer != null) eth_seg_sequencer::unregister_sqr(get_full_name(), sequencer);
   endfunction
 endclass

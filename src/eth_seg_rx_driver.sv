@@ -1,6 +1,7 @@
 // src RX 驱动层：将事务编码为 MAC 输出字节流，valid 节奏独立于 TX ready。
 // 负沿更新 RX 私有代理；valid 低时不消费字节，故周期/随机节奏只插入有效气泡，
 // 包内状态跨气泡保存。EOP 在正沿真正采样后通过 sent_ap 发布。
+// 有效拍尾部没有下一包的 segment 必须显式置 idle，避免上拍 inframe 留下伪 SOP。
 class eth_seg_rx_driver #(int RATE = 100) extends uvm_driver #(eth_seg_seq_item);
   `uvm_component_param_utils(eth_seg_rx_driver#(RATE))
   localparam int NUM_SEGMENTS = RATE/25;
@@ -38,7 +39,8 @@ class eth_seg_rx_driver #(int RATE = 100) extends uvm_driver #(eth_seg_seq_item)
   endtask
 
   // 依照 rx_valid_pattern 产生有效拍；traffic_load_pct 只在包间 idle segment 节流。
-  // 一个有效周期最多输出 NUM_SEGMENTS 段，EOP 后剩余段可立刻承载下一包 SOP。
+  // 一个有效周期最多输出 NUM_SEGMENTS 段，EOP 后剩余段可立刻承载下一包 SOP；
+  // 若没有下一包则清空这些段的边界标记，不能把上一拍的数据段解释成新报文。
   task drive_thread();
     bit send_valid;
     forever begin
@@ -97,6 +99,15 @@ class eth_seg_rx_driver #(int RATE = 100) extends uvm_driver #(eth_seg_seq_item)
               idle_left = (pct >= 100) ? 0 : $urandom_range(0, (100-pct)/10 + 1);
             end
           end
+        end else begin
+          // o_rx_mac_valid 对整拍生效，尾部空段同样会被接收方检查 inframe。
+          // 保留旧 inframe=1 会产生未结束的幽灵包，尤其易出现在宽总线的短尾拍。
+          cfg.vif.drv_rx_data[s*64 +: 64] <= '0;
+          cfg.vif.drv_rx_inframe[s] <= 1'b0;
+          cfg.vif.drv_rx_eop_empty[s*3 +: 3] <= '0;
+          cfg.vif.drv_rx_fcs_error[s] <= 1'b0;
+          cfg.vif.drv_rx_error[s*2 +: 2] <= '0;
+          cfg.vif.drv_rx_status_data[s*3 +: 3] <= '0;
         end
       end
     end

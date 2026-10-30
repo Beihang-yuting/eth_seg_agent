@@ -1,4 +1,4 @@
-// test/bind 验证层：检查真实 bind 创建的 root agent、配置传递和双向报文读回。
+// test/bind 验证层：检查双参数 bind、#0 初始化、静态 sqr、多实例隔离及双向读回。
 // 依赖 UVM、eth_seg_pkg、eth_seg_types_pkg；本 package 不创建 interface 或 agent，
 // 只借用 wrapper 发布的句柄，拥有 sequence、期望队列及六路 monitor 接收器。
 package eth_seg_bind_test_pkg;
@@ -88,6 +88,37 @@ package eth_seg_bind_test_pkg;
       super.new(name, parent);
     endfunction
 
+    // 顶层 #0 后、run_test 前调用；先验证 wrapper 没有覆盖任何行为默认值，
+    // 再为闭环测试选择 MAC/passive 和格式/节奏，模拟用户自行调整 cfg。
+    static function void configure(eth_seg_config#(RATE) c, m, o);
+      eth_seg_config#(RATE) configs[3];
+      configs[0] = c;
+      configs[1] = m;
+      configs[2] = o;
+      foreach (configs[i]) begin
+        if (configs[i] == null)
+          uvm_pkg::uvm_report_fatal("BIND_INIT", "#0 did not observe synchronous cfg creation");
+        if (configs[i].role != ETH_SEG_CLIENT || configs[i].is_active != UVM_ACTIVE ||
+            configs[i].preamble_passthrough || configs[i].include_fcs ||
+            configs[i].ready_pattern != ETH_SEG_CONTINUOUS || configs[i].rx_valid_pattern != ETH_SEG_CONTINUOUS ||
+            configs[i].traffic_load_pct != 100 || configs[i].random_load)
+          uvm_pkg::uvm_report_fatal("BIND_DEFAULT", "wrapper must preserve cfg defaults");
+        configs[i].preamble_passthrough = (RATE != 100);
+        configs[i].include_fcs = (RATE == 400);
+      end
+      m.role = ETH_SEG_MAC;
+      o.is_active = UVM_PASSIVE;
+      m.enable_protocol_check = 0;
+      o.enable_protocol_check = 0;
+      m.ready_pattern = (RATE == 100) ? ETH_SEG_CONTINUOUS :
+                        (RATE == 200) ? ETH_SEG_PERIODIC : ETH_SEG_RANDOM;
+      m.rx_valid_pattern = m.ready_pattern;
+      c.traffic_load_pct = (RATE == 400) ? 50 : 100;
+      m.traffic_load_pct = c.traffic_load_pct;
+      c.random_load = (RATE == 400);
+      m.random_load = c.random_load;
+    endfunction
+
     // 只读取 wrapper 发布的 root 句柄；缺少实例或错误 RATE 类型会在 build 直接失败。
     function void build_phase(uvm_phase phase);
       string observer_name;
@@ -114,7 +145,7 @@ package eth_seg_bind_test_pkg;
                                    (RATE == 200) ? ETH_SEG_PERIODIC : ETH_SEG_RANDOM) ||
           mac.cfg.rx_valid_pattern != mac.cfg.ready_pattern ||
           mac.cfg.random_load != (RATE == 400) || client.cfg.traffic_load_pct != ((RATE == 400) ? 50 : 100))
-        `uvm_fatal("BIND_CONFIG", "module parameter propagation differs")
+        `uvm_fatal("BIND_CONFIG", "user cfg adjustment differs")
       foreach (tx_sink[i]) begin
         tx_sink[i] = new($sformatf("tx_sink%0d", i), this);
         rx_sink[i] = new($sformatf("rx_sink%0d", i), this);
@@ -180,6 +211,11 @@ package eth_seg_bind_test_pkg;
     // 等复位解除后启动双向流；设置周期上限并检查尾部无幽灵包、无未完报文。
     // 所有 case 由 test 的单一 objection 包住，本组件不单独控制仿真生命周期。
     task run_phase(uvm_phase phase);
+      if (eth_seg_sequencer::get_sqr(client.get_full_name()) != client.sequencer ||
+          eth_seg_sequencer::get_sqr(mac.get_full_name()) != mac.sequencer ||
+          eth_seg_sequencer::get_sqr(observer.get_full_name()) != null ||
+          eth_seg_sequencer::get_sqr("missing_agent") != null)
+        `uvm_fatal("BIND_SQR", "static sequencer registry differs or passive was registered")
       wait (client.cfg.vif.i_tx_rst_n && mac.cfg.vif.i_rx_rst_n);
       @(posedge client.cfg.vif.i_clk_tx);
       tx_seq = new("tx_seq");
@@ -187,8 +223,8 @@ package eth_seg_bind_test_pkg;
       prepare_frames(tx_seq, 0);
       prepare_frames(rx_seq, 1);
       fork
-        tx_seq.start(client.sequencer);
-        rx_seq.start(mac.sequencer);
+        tx_seq.start(eth_seg_sequencer::get_sqr(client.get_full_name()));
+        rx_seq.start(eth_seg_sequencer::get_sqr(mac.get_full_name()));
       join
       for (int cycles = 0; cycles < 2000 && !all_received(); cycles++)
         @(negedge client.cfg.vif.i_clk_tx);
@@ -212,18 +248,20 @@ package eth_seg_bind_test_pkg;
     bind_rate_case#(100) case100;
     bind_rate_case#(200) case200;
     bind_rate_case#(400) case400;
+    bind_rate_case#(100) case100b;
 
     // factory 创建测试；case 通过直接 new 保留编译期参数类型。
     function new(string name = "eth_seg_bind_test", uvm_component parent = null);
       super.new(name, parent);
     endfunction
 
-    // 创建三种宽度的验证组件，不改变外部已创建 agent 的格式和角色。
+    // 创建四个 IP 的验证组件；两个 100G 检查同类型实例不会覆盖静态 sqr。
     function void build_phase(uvm_phase phase);
       super.build_phase(phase);
       case100 = new("case100", this);
       case200 = new("case200", this);
       case400 = new("case400", this);
+      case100b = new("case100b", this);
     endfunction
 
     // 任一 case 卡住均触发有界超时；仅全部完成后发布严格日志检查使用的完成标记。
@@ -231,7 +269,9 @@ package eth_seg_bind_test_pkg;
       phase.raise_objection(this);
       fork : completion_or_timeout
         begin
-          wait (case100.done && case200.done && case400.done);
+          wait (case100.done && case200.done && case400.done && case100b.done);
+          if (eth_seg_sequencer::sqr.num() != 8)
+            `uvm_fatal("BIND_SQR_COUNT", "four links must publish eight independent active sequencers")
           `uvm_info("ETH_BIND_TEST_COMPLETE", "all bind integration checks completed", UVM_NONE)
         end
         begin

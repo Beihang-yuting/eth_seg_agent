@@ -1,6 +1,6 @@
 // test/bind HDL 验证层：提供只有解析 net 的目标壳，通过模块类型 bind 注入三个 wrapper。
 // 目标壳拥有原始 strong 驱动；wrapper 拥有 interface，UVM root 拥有 agent。
-// 100G/400G 验证 supply 接管，200G 验证普通 strong 直连；均使用实际 bind 语句。
+// 四个 IP 覆盖三种速率；验证 supply 接管、默认 cfg 和 #0 启动，均使用真实 bind。
 `timescale 1ns/1ps
 module eth_seg_bind_target #(
   parameter int RATE = 100,
@@ -27,7 +27,7 @@ module eth_seg_bind_target #(
   wire [NUM_SEGMENTS*3-1:0] o_rx_mac_status_data;
 
   // 原驱动故意保持全 1，与 agent 的空闲值和数据相冲突，供 supply 接管验证。
-  // 关闭 OVERRIDE 时原驱动为 Z，普通 strong wrapper 成为该方向的唯一驱动。
+  // 关闭 OVERRIDE 时原驱动为 Z，wrapper 成为该方向的唯一驱动。
   assign i_tx_mac_data = OVERRIDE ? '1 : 'z;
   assign i_tx_mac_valid = OVERRIDE ? '1 : 'z;
   assign i_tx_mac_inframe = OVERRIDE ? '1 : 'z;
@@ -125,34 +125,18 @@ module eth_seg_bind_target #(
   end
 endmodule
 
-// bind 中的 RATE、PORT_NAME、OVERRIDE 均取自目标实例，因此同一段声明适配三种速率。
-// 显式名字加端口前缀；observer 留空，覆盖 wrapper 的层次自动命名逻辑。
+// bind 仅传 RATE 和名字；cfg 使用默认值，测试在 #0 后、run_test 前自行调整。
+// 同一 module 类型的四个实例都会绑定；observer 留空测试层次自动命名。
 bind eth_seg_bind_target eth_seg_bind_wrapper #(
-  .RATE(RATE), .AGENT_NAME({PORT_NAME, "_client"}),
-  .ROLE(eth_seg_types_pkg::ETH_SEG_CLIENT),
-  .PREAMBLE_PASSTHROUGH(RATE != 100), .INCLUDE_FCS(RATE == 400),
-  .OVERRIDE_DUT(OVERRIDE), .ENABLE_CHECKER(1),
-  .TRAFFIC_LOAD_PCT((RATE == 400) ? 50 : 100),
-  .RANDOM_LOAD(RATE == 400)
+  .RATE(RATE), .AGENT_NAME({PORT_NAME, "_client"})
 ) u_client (.*);
 
 bind eth_seg_bind_target eth_seg_bind_wrapper #(
-  .RATE(RATE), .AGENT_NAME({PORT_NAME, "_mac"}),
-  .ROLE(eth_seg_types_pkg::ETH_SEG_MAC),
-  .PREAMBLE_PASSTHROUGH(RATE != 100), .INCLUDE_FCS(RATE == 400),
-  .OVERRIDE_DUT(OVERRIDE), .ENABLE_CHECKER(0),
-  .READY_PATTERN((RATE == 100) ? eth_seg_types_pkg::ETH_SEG_CONTINUOUS :
-                 (RATE == 200) ? eth_seg_types_pkg::ETH_SEG_PERIODIC : eth_seg_types_pkg::ETH_SEG_RANDOM),
-  .RX_VALID_PATTERN((RATE == 100) ? eth_seg_types_pkg::ETH_SEG_CONTINUOUS :
-                    (RATE == 200) ? eth_seg_types_pkg::ETH_SEG_PERIODIC : eth_seg_types_pkg::ETH_SEG_RANDOM),
-  .TRAFFIC_LOAD_PCT((RATE == 400) ? 50 : 100),
-  .RANDOM_LOAD(RATE == 400)
+  .RATE(RATE), .AGENT_NAME({PORT_NAME, "_mac"})
 ) u_mac (.*);
 
 bind eth_seg_bind_target eth_seg_bind_wrapper #(
-  .RATE(RATE), .ACTIVE_MODE(uvm_pkg::UVM_PASSIVE),
-  .PREAMBLE_PASSTHROUGH(RATE != 100), .INCLUDE_FCS(RATE == 400),
-  .OVERRIDE_DUT(OVERRIDE), .ENABLE_CHECKER(0)
+  .RATE(RATE)
 ) u_observer (.*);
 
 // 顶层只生成时钟/复位并协调 time-0；不能在任何 wrapper 内各自调用 run_test。
@@ -170,17 +154,24 @@ module tb_bind;
     (clk_tx, clk_rx, rst_n, rst_n);
   eth_seg_bind_target #(.RATE(400), .PORT_NAME("case400"), .OVERRIDE(1)) link400
     (clk_tx, clk_rx, rst_n, rst_n);
+  eth_seg_bind_target #(.RATE(100), .PORT_NAME("case100b"), .OVERRIDE(1)) link100b
+    (clk_tx, clk_rx, rst_n, rst_n);
 
   // 41 ns 避开两种时钟的正负沿，给所有 root driver 留出多个完整复位周期。
   initial #41ns rst_n = 1;
 
   initial begin
-    wait (link100.u_client.initialized && link100.u_mac.initialized && link100.u_observer.initialized &&
-          link200.u_client.initialized && link200.u_mac.initialized && link200.u_observer.initialized &&
-          link400.u_client.initialized && link400.u_mac.initialized && link400.u_observer.initialized);
+    // 所有 wrapper 在 Active 区同步创建 cfg/agent；#0 进入 Inactive 区再取句柄。
+    // 此处还没有 sequencer，后续 run_test 的 build/connect 才会创建并注册它。
+    #0;
+    bind_rate_case#(100)::configure(link100.u_client.cfg, link100.u_mac.cfg, link100.u_observer.cfg);
+    bind_rate_case#(200)::configure(link200.u_client.cfg, link200.u_mac.cfg, link200.u_observer.cfg);
+    bind_rate_case#(400)::configure(link400.u_client.cfg, link400.u_mac.cfg, link400.u_observer.cfg);
+    bind_rate_case#(100)::configure(link100b.u_client.cfg, link100b.u_mac.cfg, link100b.u_observer.cfg);
     uvm_config_db#(string)::set(null, "uvm_test_top.case100", "observer_name", link100.u_observer.resolved_name);
     uvm_config_db#(string)::set(null, "uvm_test_top.case200", "observer_name", link200.u_observer.resolved_name);
     uvm_config_db#(string)::set(null, "uvm_test_top.case400", "observer_name", link400.u_observer.resolved_name);
+    uvm_config_db#(string)::set(null, "uvm_test_top.case100b", "observer_name", link100b.u_observer.resolved_name);
     run_test("eth_seg_bind_test");
   end
 

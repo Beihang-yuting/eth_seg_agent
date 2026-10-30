@@ -1,41 +1,14 @@
-# 用参数化 module bind 接入 DUT
+# 简化 bind 与静态 sequencer
 
-`bind/eth_seg_bind_wrapper.sv` 按图片中的结构实现：module 内实例化
-`eth_seg_if#(RATE)`，创建 `eth_seg_agent#(RATE)`，再用连续赋值接入 DUT 的 net。
-agent 用 `type_id::create(name, null)` 创建，是 UVM root 的子组件，会正常参加 UVM phase。
-wrapper 内不调用 `run_test()`。
+`eth_seg_bind_wrapper` 只保留两个可覆盖参数：`AGENT_NAME` 和 `RATE`。
+wrapper 内同步创建 interface、默认 cfg 和 root agent；顶层 env 无需创建 agent，
+也无需创建 virtual sequencer 来转接句柄。
 
-## 1. 选择替代哪一端
-
-所有 TX/RX 名称均从 **MAC IP 视角**定义，与文档一致。
-
-| 模式 | wrapper 驱动 | wrapper 观察 | 典型用途 |
-|---|---|---|---|
-| `ETH_SEG_CLIENT` + `UVM_ACTIVE` | `i_tx_mac_*` | TX、RX 和 `o_tx_mac_ready` | 给真实 MAC DUT 发包 |
-| `ETH_SEG_MAC` + `UVM_ACTIVE` | `o_rx_mac_*`、`o_tx_mac_ready` | TX、RX 和 ready | 替代 MAC，验证用户逻辑 |
-| `UVM_PASSIVE` | 全部输出为 Z | 双向全部引脚 | 在现有链路旁挂监视器 |
-
-同一组引脚通常只需要一个 wrapper。测试示例同时绑定 CLIENT、MAC 和 passive，是为了
-闭环自检：CLIENT 和 MAC 各自驱动不同方向。每个方向只能有一个 active 驱动者；不同
-wrapper 的 interface 独立，其内部所有权检查不能代替系统级的重复绑定检查。
-
-## 2. 绑定一个实例
-
-下面替代 MAC 一侧；将右侧信号名改为 `tb_top.u_dut` 内实际存在的 **wire/tri net**。
-如果是要驱动真实 MAC 的 TX 输入，将 `ROLE` 改为 `ETH_SEG_CLIENT`。
+## 1. 绑定与信号映射
 
 ```systemverilog
-bind tb_top.u_dut eth_seg_bind_wrapper #(
-  .RATE                 (400),
-  .AGENT_NAME           ("eth0"),
-  .ROLE                 (eth_seg_types_pkg::ETH_SEG_MAC),
-  .ACTIVE_MODE          (uvm_pkg::UVM_ACTIVE),
-  .PREAMBLE_PASSTHROUGH  (0),
-  .INCLUDE_FCS          (0),
-  .OVERRIDE_DUT         (1),
-  .READY_PATTERN        (eth_seg_types_pkg::ETH_SEG_PERIODIC),
-  .READY_HIGH_CYCLES    (8),
-  .READY_LOW_CYCLES     (2)
+bind tb_top.u_dut.u_ip0 eth_seg_bind_wrapper #(
+  .AGENT_NAME("eth0"), .RATE(400)
 ) u_eth_bind (
   .i_clk_tx             (tx_clk),
   .i_clk_rx             (rx_clk),
@@ -58,166 +31,145 @@ bind tb_top.u_dut eth_seg_bind_wrapper #(
 );
 ```
 
-如果目标 module 的引脚名称与 wrapper 完全一致，可把端口连接写成 `u_eth_bind (.*)`。
-需要按 module 类型绑定所有实例时，参数表达式可以引用目标 module 的参数：
+左侧是 wrapper 端口，右侧是绑定目标内部的真实信号。名称相同时可用 `(.*)`。
+四个 IP 分别绑定，并使用不同名字；速率必须匹配实际宽度：
 
 ```systemverilog
-// my_eth_port 内须有参数 ETH_RATE_G；每个实例可以分别设置为 100/200/400。
-// 名称留空，由每个绑定实例的完整 HDL 层次生成不同的 root agent 名称。
-bind my_eth_port eth_seg_bind_wrapper #(
-  .RATE(ETH_RATE_G),
-  .AGENT_NAME(""),
-  .ROLE(eth_seg_types_pkg::ETH_SEG_CLIENT)
-) u_eth_bind (.*);
+// 以下假设各 IP 内信号名称与 wrapper 一致。
+bind tb_top.u_dut.u_ip0 eth_seg_bind_wrapper #(.AGENT_NAME("eth0"), .RATE(100)) u_eth_bind (.*);
+bind tb_top.u_dut.u_ip1 eth_seg_bind_wrapper #(.AGENT_NAME("eth1"), .RATE(200)) u_eth_bind (.*);
+bind tb_top.u_dut.u_ip2 eth_seg_bind_wrapper #(.AGENT_NAME("eth2"), .RATE(400)) u_eth_bind (.*);
+bind tb_top.u_dut.u_ip3 eth_seg_bind_wrapper #(.AGENT_NAME("eth3"), .RATE(100)) u_eth_bind (.*);
 ```
 
-显式 `AGENT_NAME` 只能包含字母、数字、下划线，且必须全仿真唯一。
-重复名字在 time-0 报 `ETH_BIND_NAME` 并终止；自动生成的名字可从
-`u_eth_bind.resolved_name` 取得。
+若这些 IP 来自同一 module 类型，也可按类型绑定一次。将 `RATE` 连接目标的速率参数，
+`AGENT_NAME` 连接目标的唯一名字参数，或留空自动从 HDL 层次生成。显式名字只允许
+字母、数字和下划线，必须全仿真唯一；自动名字从 wrapper 的 `resolved_name` 读取。
 
-## 3. 参数与驱动行为
+| RATE | segments | data 宽度 |
+|---|---:|---:|
+| 100 | 4 | 256 |
+| 200 | 8 | 512 |
+| 400 | 16 | 1024 |
 
-| 参数 | 默认值 | 含义 |
-|---|---|---|
-| `RATE` | `100` | 编译期速率类型，只支持 100/200/400 |
-| `AGENT_NAME` | `""` | 空字符串按绑定层次生成名字，否则用指定 root 名字 |
-| `ROLE` / `ACTIVE_MODE` | CLIENT / ACTIVE | 选择驱动方向或纯监视 |
-| `PREAMBLE_PASSTHROUGH` / `INCLUDE_FCS` | `0` / `0` | 前导透传、接口保留 FCS |
-| `OVERRIDE_DUT` | `1` | supply 强度接管原 strong net 驱动；0 使用普通 strong |
-| `ENABLE_CHECKER` | `1` | 静态实例化双向协议检查器 |
-| `READY_PATTERN` / `RX_VALID_PATTERN` | CONTINUOUS | 支持 CONTINUOUS、PERIODIC、RANDOM |
-| `READY_HIGH_CYCLES` / `READY_LOW_CYCLES` | `8` / `2` | ready 周期模式高/低拍数 |
-| `RX_VALID_HIGH_CYCLES` / `RX_VALID_LOW_CYCLES` | `8` / `2` | RX valid 周期模式高/低拍数 |
-| `READY_HIGH_PCT` / `RX_VALID_HIGH_PCT` | `70` / `70` | 随机模式逐拍有效概率，范围 0..100 |
-| `TRAFFIC_LOAD_PCT` | `100` | 包间节流设置；100 表示不主动插入负载间隙 |
-| `RANDOM_LOAD` | `0` | 在启用包间节流时随机选择负载设置 |
-| `LOAD_MIN_PCT` / `LOAD_MAX_PCT` | `10` / `100` | 随机负载范围，1..100 |
-| `MAX_PENDING` | `64` | driver 预取事务队列上限 |
+输出固定采用图片中的 `assign (supply1, supply0)`，按 interface 驱动所有权决定是否驱动。
+绑定点必须是 `wire/tri` 网络；对于 IP 内过程赋值的变量，选择父层连接 IP 的 net。
+TX invalid 拍仍保持驱动，不能用 valid 为条件释放引脚。不同 wrapper 的同一方向只能
+有一个 active 驱动者。TX valid 固定等于 ready 延后两拍。
 
-| RATE | segments | data 宽度 | inframe / TX error / skip_crc / RX fcs_error | eop_empty / status_data | RX error |
-|---|---:|---:|---:|---:|---:|
-| 100 | 4 | 256 | 4 | 12 | 8 |
-| 200 | 8 | 512 | 8 | 24 | 16 |
-| 400 | 16 | 1024 | 16 | 48 | 32 |
+## 2. 默认 cfg 与 #0 启动
 
-`RATE` 决定类型和宽度，运行中不能从 100 切换为 400。线上的实际吞吐还取决于时钟、
-ready、RX valid 与报文间隙。负载百分比是现有 driver 的间隙策略输入，不保证精确的
-Gbps 或占空比；启用随机包间节流需同时设置 `TRAFFIC_LOAD_PCT < 100` 和 `RANDOM_LOAD=1`。
+`eth_seg_config#(RATE)` 保留类型参数，因为 virtual interface 的宽度需要类型匹配。
+bind 不再覆盖行为字段：默认 CLIENT active、无前导、无 FCS、连续 ready/RX valid、
+100% 负载设置。默认事务从目的 MAC 开始，到 payload 结束。
 
-TX 的 `valid` 固定等于 ready 延后两拍，wrapper 没有可调延时参数。
-TX valid 低时仍驱动并保持数据和边带；因此驱动使能基于角色和 interface 所有权，
-不能像 APB 的 `psel` 示例那样以 valid 为条件输出 Z。RX 无 ready，valid 可独立插入气泡。
-
-默认事务和接口字节均从目的 MAC 开始、到 payload 结束。开启前导时，driver 自动添加
-`55×7 + D5`，monitor 移除前导。开启 FCS 时，driver 为 `fcs_present=0` 的事务补 CRC，
-为 `fcs_present=1` 的事务保留已有 CRC；monitor 的 `frame_bytes` 会保留末尾四字节 FCS。
-该选项仅配置 VIP 的行为，真实 MAC IP 的透传/FCS 设置也需与之匹配。
-
-`OVERRIDE_DUT=1` 使用图片中的 `assign (supply1, supply0)`，可以覆盖通常为 strong 的原
-连续 net 驱动。使用 0 时，应先让原驱动为 Z 或确保该方向没有其他驱动者；同强度相反值
-会解析为 X。此方式需要解析型 net，不能直接接到被 `always_ff` 等过程赋值的变量上。
-应绑定连接生产者与消费者的 wire，或先在 testbench 暴露对应 net；它不使用 force/release。
-
-输出直接来自 interface 的 `drv_*` 代理，实际 DUT net 再单向读回 interface 公共引脚。
-这样 monitor 能观察外部解析结果，包括冲突，而不会形成连续赋值反馈环路。
-checker 也直接读取 DUT net。`ENABLE_CHECKER` 决定静态生成，运行中修改 cfg 字段不会
-创建或删除它；同一链路有多个 wrapper 时可只开启一个 checker。
-
-## 4. 启动 UVM 与取得 agent
-
-把已有顶层的 `run_test()` 初始块改为等待所有 wrapper 初始化完成，整个仿真只调用一次。
-这避免 module initial 与 UVM build 在 time-0 竞争，不依赖简单的 `#0` 延时：
+顶层只需一个启动块：
 
 ```systemverilog
 initial begin
-  wait (u_dut.u_eth_bind.initialized);
-  // 多个绑定实例时，等待所有实例的 initialized。
+  #0;
   run_test();
 end
 ```
 
-wrapper 发布三个类型化键：`eth0_agent`、`eth0_cfg`、`eth0_vif`，作用域覆盖
-`uvm_test_top` 及其子组件。原 env 无需再次创建 agent，在 build 中取得句柄，
-connect 中连接 monitor，run 中启动 sequence 即可：
+这是基于当前实现的明确约定：所有 wrapper 的 `initial` 都在 time-0 Active 区同步完成
+cfg 和 agent 创建，没有 `#delay`、事件等待或 NBA 句柄发布。顶层 `#0` 进入 Inactive
+区后才调用 `run_test()`，不再需要 `initialized` 标记。若以后给 wrapper 初始化增加
+异步步骤，这个约定就需要重新设计。
+
+**#0 仅保证 cfg/agent 已创建，不代表 sequencer 已创建。** sequencer 在 UVM build
+创建、connect 中自动登记；从 `start_of_simulation` 或 `run_phase` 起使用静态表。
+
+需要调整默认配置时，用户可在 `#0` 后、`run_test` 前直接改已有 cfg。例如替代 MAC
+输出，验证用户逻辑：
 
 ```systemverilog
-// 放在自己的 env/test class 中；RATE 必须与绑定实例完全相同。
-eth_seg_agent#(400) eth0;
-
-// build_phase 内：只获取句柄；其他 root agent 的 build 此时可能尚未执行。
-if (!uvm_config_db#(eth_seg_agent#(400))::get(this, "", "eth0_agent", eth0))
-  `uvm_fatal("ETH_BIND", "missing eth0_agent")
-
-// connect_phase 内：此时 monitor、sequencer、driver 已构建完成。
-// eth0.tx_monitor.item_collected_port.connect(sb.tx_export);
-// eth0.rx_monitor.item_collected_port.connect(sb.rx_export);
+initial begin
+  #0;
+  u_dut.u_ip0.u_eth_bind.cfg.role = eth_seg_types_pkg::ETH_SEG_MAC;
+  // 其他行为按需调整；默认值集中在 src/eth_seg_config.sv。
+  run_test();
+end
 ```
 
-本例层次是 `uvm_top.eth0` 与 `uvm_top.uvm_test_top.env` 并列。组件的
-`get_full_name()` 返回 `eth0`，不是 `uvm_test_top.env.eth0`。
-如果使用 virtual sequencer，可在 connect 中把 `eth0.sequencer` 交给现有 vseq。
-角色、active/passive 和报文格式由绑定参数确定，避免在 build 后更改这些字段。
+CLIENT 驱动 `i_tx_mac_*`；MAC 驱动 `o_rx_mac_*` 和 `o_tx_mac_ready`；PASSIVE 只监视。
+角色、active/passive、格式和队列深度应在构建/发包前确定，不能在包中途切换。
+checker 默认打开；`cfg.enable_protocol_check` 由各时钟负沿采样，需在复位/build 前设置。
 
-下面是 MAC 模式发送 RX 的 run task 示例；CLIENT 模式发送 TX 时，把计数改用
-`tx_monitor.packets_seen`，并等待 TX reset：
+原有 `eth0_agent`、`eth0_cfg`、`eth0_vif` 三个 config_db 键继续保留，方便连接 scoreboard。
+句柄作用域覆盖 `uvm_test_top` 及子组件，获取时 RATE 类型必须匹配。
+
+## 3. 静态 sqr 与 Tcl 发包
+
+每个 active agent 在 connect 自动登记，final 时撤销；PASSIVE 不登记。
+静态表定义在非参数化 `eth_seg_sequencer` 中，三种速率共用一张按名字索引的表：
 
 ```systemverilog
-// 等待 reset 后送入 4 帧，再等待 monitor 的真实 EOP 完成；不能只等待 seq.start 返回。
-task run_phase(uvm_phase phase);
-  eth_seg_frame_seq seq;
-  int unsigned target;
-  phase.raise_objection(this);
-  wait (eth0.cfg.vif.i_rx_rst_n);
-  seq = eth_seg_frame_seq::type_id::create("seq");
-  seq.frame_count = 4;
-  seq.frame_length = 256;
-  target = eth0.rx_monitor.packets_seen + seq.frame_count;
-  fork : send_and_timeout
-    begin
-      seq.start(eth0.sequencer);
-      wait (eth0.rx_monitor.packets_seen >= target);
-    end
-    begin
-      #100us;
-      `uvm_fatal("ETH_TIMEOUT", "RX packets did not complete")
-    end
-  join_any
-  disable send_and_timeout;
-  phase.drop_objection(this);
-endtask
+eth_seg_sequencer::sqr["eth0"]
+eth_seg_sequencer::sqr["eth1"]
+eth_seg_sequencer::sqr["eth2"]
+eth_seg_sequencer::sqr["eth3"]
 ```
 
-## 5. 编译与可运行示例
+推荐查询接口 `eth_seg_sequencer::get_sqr("eth0")`：名字不存在时返回 null，不插入表项。
+表只保存借用句柄，不创建或共享实际 sequencer；四个 IP 有四个独立仲裁器。
+如果 agent 由普通 env 创建，索引使用完整名字，例如 `uvm_test_top.env.client`。
 
-UVM 1.2 之外的源码顺序如下，include 路径至少包含 `src`、`rtl` 和 `seq_lib`：
+基于 `aip_core/update` 的可选示例在 `examples/aip/eth_seg_aip_pkg.sv`：
 
-```text
-rtl/eth_seg_if.sv
-src/eth_seg_types.sv
-src/eth_seg_pkg.sv
-checker/eth_seg_protocol_checker.sv
-bind/eth_seg_bind_wrapper.sv
-<自己的 test package、DUT、tb_top 和 bind 声明文件>
+```systemverilog
+// 该 sequence 提供 count 字段，body 内按当前 agent 名字读取 frame_length。
+`aip_cmd_seq(eth0_send, eth_seg_aip_frame_seq, eth_seg_sequencer::get_sqr("eth0"))
 ```
 
-仓库中 `test/bind/tb_bind.sv` 是完整 HDL 示例，按 module 类型绑定 100/200/400 三个实例。
-`test/bind/eth_seg_bind_test_pkg.sv` 展示取得 root agent、连接 monitor 和有界等待。
-在 **10.11.10.53** 载入 VCS 环境后运行：
+读参代码在 sequence 执行时运行，因此每次 Tcl 调用都能读取新值：
+
+```systemverilog
+// param_path 取实际 sequencer 的父 agent 名字，例如 "eth0"。
+int unsigned frame_length;
+`aip_int(param_path, int unsigned, frame_length, 256)
+```
+
+Tcl 对应使用：
+
+```tcl
+source [file join $::env(AIP_CORE) dist aip_init.tcl]
+set_param path=eth0.frame_length value=256
+set_param path=eth1.frame_length value=128
+eth0_send count=10
+eth1_send count=5
+```
+
+`aip_int` 在调用点读取参数；`set_param` 不会自动修改已经创建的 cfg 对象。
+后续配置调试可按相同方式加读参和应用逻辑，注意构建字段与包内格式的生效边界。
+本次示例只用它配置发包长度，agent cfg 保持默认值。
+
+base test 不需要 env，也不创建 agent；在 `run_phase` 持有 objection 并运行一次
+`aip_tcl_bridge::run_loop()` 即可。Tcl bridge 必须等 UVM connect 和 DUT reset 完成后接收
+发包命令。现有环境已经启动 bridge 时，复用该 bridge，不再启动第二份。
+`seq.start()` 返回仅代表 driver 已入队，结束仿真前仍须等 monitor/scoreboard 物理完成。
+`aip_cmd_seq` 的 time 模式取消 sequence 也不会撤销 driver 已接收的帧。
+
+## 4. 编译与验证
+
+普通 VIP 的编译顺序保持 interface → types → package → checker → wrapper → testbench。
+核心 VIP 无 AIP 依赖；使用 Tcl 示例时，先编译 AIP package，再编译示例 package。
+
+在 `10.11.10.53` 载入 VCS 环境后运行：
 
 ```bash
 make bind-test SEED=7
+make run BUILD=build/smoke_check SEED=7
+make aip-test AIP_CORE=/path/to/aip_core SEED=7
 ```
 
-日志为 `build/bind/logs/compile.log` 和 `build/bind/logs/bind_test.log`。
-每个 RATE 分别发送 8 帧 TX 和 8 帧 RX，三个 agent 的六路 monitor 独立比较字节、FCS
-格式及 EOP 边带，并逐拍比较全部 bound net 的读回值。100G 使用连续节奏、200G 周期
-间歇、400G 随机节奏和包间节流；覆盖默认无前导/FCS、前导开启以及前导和 FCS 同时开启。
-帧结束段固定在总线末段，empty 覆盖 0..7；这是 bind 集成验证，不代表所有驱动器边界的完整回归。
+AIP 示例对照的 `update` 提交为 `cd339eff8d4b0982be885a0a71f3e593a4aed239`。
+不自动下载、修改或提交外部依赖。完整 Tcl 用例见 `test/aip/send.tcl`。
 
-通过条件包括三个 `BIND_RATE_PASS`、`ETH_BIND_TEST_COMPLETE`、完整 UVM summary
-及零 ERROR/FATAL，且没有 VCS 原生错误。测试壳不含真实厂商 MAC RTL，实际 DUT 的信号
-名称、端口宽度和 IP 格式配置仍需按以上映射接好。
+bind 用例覆盖四个 IP（三种速率）、同速率多实例静态 sqr 隔离、默认 cfg、用户改 cfg、
+#0 启动、双向报文和所有边带。AIP 用例通过真实 UCLI/Tcl 命令发包，四个默认 CLIENT
+分别接收 3/3/1/4 帧，并逐字节核对长度、数据与端口隔离。两者都是接口自检壳，不含
+厂商 MAC RTL。日志分别在 `build/bind/logs`、`build/aip/logs`，实际验证记录见 `results/bind_static`。
 
-2026-10-30 已在 `10.11.10.53` 使用 VCS `W-2024.09-SP1` / UVM 1.2 验证：
-bind 的 seed 7、19、41 均通过，每次同时测试 100/200/400G，UVM WARNING/ERROR/FATAL
-均为 0；现有 smoke 的 seed 7 也通过。日志保存在本地 `results/bind/`（不纳入 Git）。
+2026-10-30 已在 53 的 VCS W-2024.09-SP1 / UVM 1.2 上通过：bind seed 7/19、
+smoke seed 7、AIP Tcl seed 7；最终 UVM WARNING/ERROR/FATAL 和 VCS 原生诊断均为 0。

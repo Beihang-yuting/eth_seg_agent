@@ -27,6 +27,22 @@ make bind-test SEED=7
 `eth_seg_config#(200).eth_rate_g` 也必须保持 200，否则 agent build 会立即报告错误。
 
 如需按图片中的方式，在 module 内封装 interface 和 root agent 后 `bind` 到已有 DUT，
-使用 [eth_seg_bind_wrapper](bind/eth_seg_bind_wrapper.sv)。它支持 100/200/400G、CLIENT/MAC、
-active/passive、前导/FCS 及 supply 强度接管。完整接线、启动顺序和 UVM 句柄获取见
-[bind 集成说明](docs/integration/bind.md)，可运行示例在 [test/bind](test/bind/tb_bind.sv)。
+使用 [eth_seg_bind_wrapper](bind/eth_seg_bind_wrapper.sv)，只需要 `AGENT_NAME` 和 `RATE`。
+cfg 保持默认值，顶层 `#0; run_test();` 启动；agent 自动发布静态
+`eth_seg_sequencer::sqr[agent_name]`，env 无需创建 agent 或转接 sequencer。
+完整接线、配置与时序约定见 [bind 集成说明](docs/integration/bind.md)。
+
+[AIP Tcl 示例](examples/aip/eth_seg_aip_pkg.sv) 使用 `aip_core/update` 的 `aip_cmd_seq`
+启动命名 sequencer，通过 `aip_int` 读取发包长度；核心 VIP 不依赖 AIP。
+验证入口为 `make aip-test AIP_CORE=/path/to/aip_core`，包含四个 IP 的真实 Tcl 发包测试。
+
+网络报文使用可选的 `eth_net_packet_pkg::eth_base_seq`：把
+`net_packet_pkg::packet.raw_data` 转成独立字节事务，保留协议头、payload 和 RoCEv2 ICRC，
+前导/Ethernet FCS 仍由 agent cfg 控制。支持直接设置 `seq.pkt` 后 `start(sqr)`，
+也支持派生 sequence 调用 `send_packet(pkt)`。完整编译顺序、接口和网络报文 Tcl 示例见
+[net_packet 集成说明](docs/integration/net_packet.md)。验证入口：
+
+```bash
+make net-packet-test NET_PACKET=/path/to/net_packet SEED=7
+make net-packet-aip-test NET_PACKET=/path/to/net_packet AIP_CORE=/path/to/aip_core SEED=7
+```

@@ -1,5 +1,5 @@
 # 根目录 VCS 构建入口：RATE 是原 smoke 回归标签（接口同时实例化 100/200/400）。
-# bind-test 使用独立顶层和 build/bind 目录，验证实际 bind；各目录由 make 管理生成物。
+# bind-test 验证实际 bind；aip/net-packet 目标使用外部依赖，构建目录互相独立。
 # 仿真应在 10.11.10.53 上执行，并预先载入该主机的 VCS/UVM/license 环境。
 .DEFAULT_GOAL := compile
 VCS ?= vcs
@@ -9,6 +9,9 @@ SEED ?= 1
 BUILD ?= build/$(RATE)
 SIMV := $(BUILD)/simv
 UVM_HOME ?= $(VCS_HOME)/etc/uvm-1.2
+# 外部依赖只用于相应的可选目标；普通 compile/run/bind-test 不需要它们。
+AIP_CORE ?=
+NET_PACKET ?=
 INC := +incdir+src +incdir+rtl +incdir+seq_lib +incdir+test +incdir+$(UVM_HOME)/src
 VCSFLAGS := -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps -Mdir=$(BUILD)/csrc -o $(SIMV) +define+ETH_SEG_BUILD_RATE=$(RATE) $(INC)
 SRC := rtl/eth_seg_if.sv src/eth_seg_types.sv src/eth_seg_pkg.sv \
@@ -16,8 +19,65 @@ SRC := rtl/eth_seg_if.sv src/eth_seg_types.sv src/eth_seg_pkg.sv \
 BIND_SRC := rtl/eth_seg_if.sv src/eth_seg_types.sv src/eth_seg_pkg.sv \
             checker/eth_seg_protocol_checker.sv bind/eth_seg_bind_wrapper.sv \
             test/bind/eth_seg_bind_test_pkg.sv test/bind/tb_bind.sv
+AIP_INC := +incdir+$(AIP_CORE) +incdir+$(AIP_CORE)/src/sv \
+           +incdir+$(AIP_CORE)/src/sv/core +incdir+$(AIP_CORE)/src/sv/bridge \
+           +incdir+$(AIP_CORE)/src/sv/util +incdir+$(AIP_CORE)/src/sv/plugin \
+           +incdir+$(AIP_CORE)/src/sv/cpu_mem
+AIP_SRC := $(AIP_CORE)/aip_core_pkg.sv \
+           rtl/eth_seg_if.sv src/eth_seg_types.sv src/eth_seg_pkg.sv \
+           checker/eth_seg_protocol_checker.sv bind/eth_seg_bind_wrapper.sv \
+           examples/aip/eth_seg_aip_pkg.sv test/aip/eth_seg_aip_test_pkg.sv test/aip/tb_aip.sv
+NET_INC := $(addprefix +incdir+$(NET_PACKET)/src/,common protocols protocols/l2 protocols/l3 \
+           protocols/l4 protocols/tunnel protocols/rdma protocols/storage protocols/app \
+           core parser pcap sequence stream uvm_wrapper) +incdir+$(NET_PACKET)/src
+NET_SRC := $(NET_PACKET)/src/net_packet_pkg.sv \
+           rtl/eth_seg_if.sv src/eth_seg_types.sv src/eth_seg_pkg.sv src/eth_net_packet_pkg.sv
+NET_TEST_SRC := $(NET_SRC) checker/eth_seg_protocol_checker.sv \
+                test/net_packet/eth_net_packet_test_pkg.sv test/net_packet/tb_net_packet.sv
+NET_AIP_SRC := $(AIP_CORE)/aip_core_pkg.sv $(NET_SRC) \
+               checker/eth_seg_protocol_checker.sv bind/eth_seg_bind_wrapper.sv \
+               examples/aip/eth_net_packet_aip_pkg.sv test/net_packet/eth_net_packet_test_pkg.sv \
+               test/net_packet/eth_net_packet_aip_test_pkg.sv test/net_packet/tb_net_packet_aip.sv
 
-.PHONY: compile run regress clean bind-test bind-run
+.PHONY: compile run regress clean bind-test bind-run aip-test aip-run \
+        net-packet-test net-packet-run net-packet-aip-test net-packet-aip-run
+
+net-packet-test:
+	$(MAKE) --no-print-directory net-packet-run BUILD=build/net_packet
+
+# net_packet_pkg 使用独立 package 类型，不同时使用旧 filelist.f 的 $unit 声明。
+net-packet-run:
+	test -n "$(NET_PACKET)" && test -f "$(NET_PACKET)/src/net_packet_pkg.sv"
+	mkdir -p $(BUILD)/logs $(BUILD)/csrc
+	$(VCS) $(VCSFLAGS) $(NET_INC) -top tb_net_packet $(NET_TEST_SRC) -l $(BUILD)/logs/compile.log
+	python3 scripts/check_log.py $(BUILD)/logs/compile.log compile
+	$(SIMV) +ntb_random_seed=$(SEED) -l $(BUILD)/logs/net_packet_test.log
+	python3 scripts/check_log.py $(BUILD)/logs/net_packet_test.log run ETH_NET_TEST_COMPLETE
+
+net-packet-aip-test:
+	$(MAKE) --no-print-directory net-packet-aip-run BUILD=build/net_packet_aip
+
+# AIP 必须在 net_packet_pkg 之前编译，以启用 packet.load_params 的 Tcl 参数入口。
+net-packet-aip-run:
+	test -n "$(NET_PACKET)" && test -f "$(NET_PACKET)/src/net_packet_pkg.sv"
+	test -n "$(AIP_CORE)" && test -f "$(AIP_CORE)/aip_core_pkg.sv"
+	mkdir -p $(BUILD)/logs $(BUILD)/csrc
+	$(VCS) $(VCSFLAGS) $(NET_INC) $(AIP_INC) -debug_access+all -top tb_net_packet_aip $(NET_AIP_SRC) -l $(BUILD)/logs/compile.log
+	python3 scripts/check_log.py $(BUILD)/logs/compile.log compile
+	AIP_CORE="$(abspath $(AIP_CORE))" $(SIMV) +ntb_random_seed=$(SEED) -ucli -do $(abspath test/net_packet/send.tcl) -no_save -exitstatus -l $(BUILD)/logs/net_packet_aip_test.log < /dev/null
+	python3 scripts/check_log.py $(BUILD)/logs/net_packet_aip_test.log run ETH_NET_AIP_TEST_COMPLETE
+
+aip-test:
+	$(MAKE) --no-print-directory aip-run BUILD=build/aip
+
+# 指定 aip_core/update 的源码路径；不自动下载或修改用户的 AIP 仓库。
+aip-run:
+	test -n "$(AIP_CORE)" && test -f "$(AIP_CORE)/aip_core_pkg.sv"
+	mkdir -p $(BUILD)/logs $(BUILD)/csrc
+	$(VCS) $(VCSFLAGS) $(AIP_INC) -debug_access+all -top tb_aip $(AIP_SRC) -l $(BUILD)/logs/compile.log
+	python3 scripts/check_log.py $(BUILD)/logs/compile.log compile
+	AIP_CORE="$(abspath $(AIP_CORE))" $(SIMV) +ntb_random_seed=$(SEED) -ucli -do $(abspath test/aip/send.tcl) -no_save -exitstatus -l $(BUILD)/logs/aip_test.log < /dev/null
+	python3 scripts/check_log.py $(BUILD)/logs/aip_test.log run ETH_AIP_TEST_COMPLETE
 
 # 递归 make 覆盖 BUILD，避免 bind 和原 smoke 的编译缓存或 simv 相互覆盖。
 bind-test:

@@ -1,30 +1,11 @@
 // bind 集成层：参照 module 内封装 interface + root agent 的用法，绑定已有 DUT net。
 // 依赖 eth_seg_if、eth_seg_types_pkg、eth_seg_pkg 和 eth_seg_protocol_checker。
 // wrapper 拥有 interface；agt 的生命周期由 UVM root 管理，cfg 由 wrapper 创建后共享。
-// 顶层必须等待所有 wrapper.initialized 再调用唯一的 run_test()，避免 time-0 构建竞态。
+// initial 内仅有零时间的同步创建；顶层 initial 先 #0，再调用唯一 run_test()。
+// bind 只暴露名字和速率，行为配置保留 eth_seg_config 默认值，由用户在 build 前调整。
 module eth_seg_bind_wrapper #(
   parameter int RATE = 100,
   parameter string AGENT_NAME = "",
-  parameter eth_seg_types_pkg::eth_seg_role_e ROLE = eth_seg_types_pkg::ETH_SEG_CLIENT,
-  parameter uvm_pkg::uvm_active_passive_enum ACTIVE_MODE = uvm_pkg::UVM_ACTIVE,
-  parameter bit PREAMBLE_PASSTHROUGH = 0,
-  parameter bit INCLUDE_FCS = 0,
-  // 与图片相同，默认用 supply 强度接管已有 strong net 驱动；0 则用普通 strong 驱动。
-  parameter bit OVERRIDE_DUT = 1,
-  parameter bit ENABLE_CHECKER = 1,
-  parameter eth_seg_types_pkg::eth_seg_pattern_e READY_PATTERN = eth_seg_types_pkg::ETH_SEG_CONTINUOUS,
-  parameter int READY_HIGH_CYCLES = 8,
-  parameter int READY_LOW_CYCLES = 2,
-  parameter int READY_HIGH_PCT = 70,
-  parameter eth_seg_types_pkg::eth_seg_pattern_e RX_VALID_PATTERN = eth_seg_types_pkg::ETH_SEG_CONTINUOUS,
-  parameter int RX_VALID_HIGH_CYCLES = 8,
-  parameter int RX_VALID_LOW_CYCLES = 2,
-  parameter int RX_VALID_HIGH_PCT = 70,
-  parameter int TRAFFIC_LOAD_PCT = 100,
-  parameter bit RANDOM_LOAD = 0,
-  parameter int LOAD_MIN_PCT = 10,
-  parameter int LOAD_MAX_PCT = 100,
-  parameter int MAX_PENDING = 64,
   localparam int NUM_SEGMENTS = RATE / 25,
   localparam int DATA_WIDTH = NUM_SEGMENTS * 64
 ) (
@@ -59,7 +40,6 @@ module eth_seg_bind_wrapper #(
   eth_seg_agent#(RATE) agt;
   eth_seg_config#(RATE) cfg;
   string resolved_name;
-  bit initialized = 0;
 
   // 公共网络只用于读取实际 DUT 引脚；输出必须来自 drv_*，避免 assign 环路。
   // interface 内部还存在 strong 代理驱动，supply 回读保证 monitor 看见外部解析结果，
@@ -81,12 +61,15 @@ module eth_seg_bind_wrapper #(
 
   // 领取驱动权后一直驱动，包含 reset 和 valid=0；不能用 valid 做高阻门控，
   // 否则 TX invalid hold 和两拍 ready 响应会被被接管的原驱动破坏。
-  wire tx_enable = (ACTIVE_MODE == UVM_ACTIVE && ROLE == ETH_SEG_CLIENT) && u_eth_if.tx_drive_enabled;
-  wire rx_enable = (ACTIVE_MODE == UVM_ACTIVE && ROLE == ETH_SEG_MAC) && u_eth_if.rx_drive_enabled;
-  wire ready_enable = (ACTIVE_MODE == UVM_ACTIVE && ROLE == ETH_SEG_MAC) && u_eth_if.ready_drive_enabled;
+  // agent 按 cfg.role / cfg.is_active 创建 driver，driver 领取所属方向的所有权。
+  // 因此不再用静态 ROLE 参数二次门控，用户在 build 前改 cfg 也能正确选择方向。
+  wire tx_enable = u_eth_if.tx_drive_enabled;
+  wire rx_enable = u_eth_if.rx_drive_enabled;
+  wire ready_enable = u_eth_if.ready_drive_enabled;
 
+  // 固定采用图片中的 supply 接管方式；未领取的方向始终为 Z。
   generate
-    if (OVERRIDE_DUT) begin : g_supply
+    begin : g_supply
       assign (supply1, supply0) i_tx_mac_data = tx_enable ? u_eth_if.drv_tx_data : 'z;
       assign (supply1, supply0) i_tx_mac_valid = tx_enable ? u_eth_if.drv_tx_valid : 'z;
       assign (supply1, supply0) i_tx_mac_inframe = tx_enable ? u_eth_if.drv_tx_inframe : 'z;
@@ -101,22 +84,6 @@ module eth_seg_bind_wrapper #(
       assign (supply1, supply0) o_rx_mac_fcs_error = rx_enable ? u_eth_if.drv_rx_fcs_error : 'z;
       assign (supply1, supply0) o_rx_mac_error = rx_enable ? u_eth_if.drv_rx_error : 'z;
       assign (supply1, supply0) o_rx_mac_status_data = rx_enable ? u_eth_if.drv_rx_status_data : 'z;
-    end
-    else begin : g_strong
-      assign i_tx_mac_data = tx_enable ? u_eth_if.drv_tx_data : 'z;
-      assign i_tx_mac_valid = tx_enable ? u_eth_if.drv_tx_valid : 'z;
-      assign i_tx_mac_inframe = tx_enable ? u_eth_if.drv_tx_inframe : 'z;
-      assign i_tx_mac_eop_empty = tx_enable ? u_eth_if.drv_tx_eop_empty : 'z;
-      assign i_tx_mac_error = tx_enable ? u_eth_if.drv_tx_error : 'z;
-      assign i_tx_mac_skip_crc = tx_enable ? u_eth_if.drv_tx_skip_crc : 'z;
-      assign o_tx_mac_ready = ready_enable ? u_eth_if.drv_ready : 'z;
-      assign o_rx_mac_data = rx_enable ? u_eth_if.drv_rx_data : 'z;
-      assign o_rx_mac_valid = rx_enable ? u_eth_if.drv_rx_valid : 'z;
-      assign o_rx_mac_inframe = rx_enable ? u_eth_if.drv_rx_inframe : 'z;
-      assign o_rx_mac_eop_empty = rx_enable ? u_eth_if.drv_rx_eop_empty : 'z;
-      assign o_rx_mac_fcs_error = rx_enable ? u_eth_if.drv_rx_fcs_error : 'z;
-      assign o_rx_mac_error = rx_enable ? u_eth_if.drv_rx_error : 'z;
-      assign o_rx_mac_status_data = rx_enable ? u_eth_if.drv_rx_status_data : 'z;
     end
   endgenerate
 
@@ -142,24 +109,6 @@ module eth_seg_bind_wrapper #(
       $fatal(1, "ETH_BIND_NAME: duplicate root agent %s", resolved_name);
     cfg = eth_seg_config#(RATE)::type_id::create({resolved_name, "_cfg"});
     cfg.vif = u_eth_if;
-    cfg.role = ROLE;
-    cfg.is_active = ACTIVE_MODE;
-    cfg.preamble_passthrough = PREAMBLE_PASSTHROUGH;
-    cfg.include_fcs = INCLUDE_FCS;
-    cfg.enable_protocol_check = ENABLE_CHECKER;
-    cfg.ready_pattern = READY_PATTERN;
-    cfg.ready_high_cycles = READY_HIGH_CYCLES;
-    cfg.ready_low_cycles = READY_LOW_CYCLES;
-    cfg.ready_high_pct = READY_HIGH_PCT;
-    cfg.rx_valid_pattern = RX_VALID_PATTERN;
-    cfg.rx_valid_high_cycles = RX_VALID_HIGH_CYCLES;
-    cfg.rx_valid_low_cycles = RX_VALID_LOW_CYCLES;
-    cfg.rx_valid_high_pct = RX_VALID_HIGH_PCT;
-    cfg.traffic_load_pct = TRAFFIC_LOAD_PCT;
-    cfg.random_load = RANDOM_LOAD;
-    cfg.load_min_pct = LOAD_MIN_PCT;
-    cfg.load_max_pct = LOAD_MAX_PCT;
-    cfg.max_pending = MAX_PENDING;
     if (!cfg.validate(reason)) $fatal(1, "ETH_BIND_CFG: %s", reason);
     agt = eth_seg_agent#(RATE)::type_id::create(resolved_name, null);
     agt.cfg = cfg;
@@ -167,12 +116,18 @@ module eth_seg_bind_wrapper #(
     uvm_config_db#(eth_seg_agent#(RATE))::set(null, "uvm_test_top*", {resolved_name, "_agent"}, agt);
     uvm_config_db#(eth_seg_config#(RATE))::set(null, "uvm_test_top*", {resolved_name, "_cfg"}, cfg);
     uvm_config_db#(virtual eth_seg_if#(RATE))::set(null, "uvm_test_top*", {resolved_name, "_vif"}, u_eth_if);
-    initialized = 1;
   end
 
-  // checker 读取绑定端口，而非内部驱动值；reset 边界与 DUT 使用相同的两个时钟。
+  // checker 读取绑定端口；开关来自默认 cfg，用户需在 reset/build 前设置，
+  // 不支持在已有 ready 历史或在途报文中途开关检查器。
+  // VCS 不允许连续赋值直接引用 class handle；各时钟负沿采样配置，供下一正沿使用。
+  bit check_tx_enable = 0, check_rx_enable = 0;
+  always @(negedge i_clk_tx)
+    check_tx_enable <= (cfg != null) ? cfg.enable_protocol_check : 1'b0;
+  always @(negedge i_clk_rx)
+    check_rx_enable <= (cfg != null) ? cfg.enable_protocol_check : 1'b0;
   generate
-    if (ENABLE_CHECKER) begin : g_check
+    begin : g_check
       eth_seg_protocol_checker #(.RATE(RATE)) protocol_check (
         .i_clk_tx(i_clk_tx), .i_clk_rx(i_clk_rx),
         .i_tx_rst_n(i_tx_rst_n), .i_rx_rst_n(i_rx_rst_n),
@@ -183,7 +138,7 @@ module eth_seg_bind_wrapper #(
         .o_rx_mac_valid(o_rx_mac_valid), .o_rx_mac_inframe(o_rx_mac_inframe),
         .o_rx_mac_eop_empty(o_rx_mac_eop_empty), .o_rx_mac_fcs_error(o_rx_mac_fcs_error),
         .o_rx_mac_error(o_rx_mac_error), .o_rx_mac_status_data(o_rx_mac_status_data),
-        .enable_tx(1'b1), .enable_rx(1'b1)
+        .enable_tx(check_tx_enable), .enable_rx(check_rx_enable)
       );
     end
   endgenerate
