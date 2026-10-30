@@ -1,0 +1,9 @@
+# 本工程的仿真输出按速率隔离，保留源码及文档。
+build/
+results/
+*.vpd
+*.fsdb
+*.vcd
+*.vdb/
+__pycache__/
+.superpowers/

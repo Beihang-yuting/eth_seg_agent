@@ -1,0 +1,4 @@
+# name  RATE  TEST  seed
+smoke_100 100 eth_seg_smoke_test 1
+smoke_200 200 eth_seg_smoke_test 2
+smoke_400 400 eth_seg_smoke_test 3
