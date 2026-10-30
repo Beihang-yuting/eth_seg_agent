@@ -8,7 +8,7 @@
 默认事务从目的 MAC 字节开始，不含前导和 FCS。配置 `preamble_passthrough` 或 `include_fcs`
 后，codec/monitor 会处理 7×55、D5 前导及低字节优先 CRC32。`fcs_present` 明确表示事务已经
 携带 FCS，`inject_fcs_error` 只在 FCS 开启时翻转 CRC；驱动 `item_done` 仅表示已复制入队，
-物理完成请观察 `sent_ap`、monitor 计数或 scoreboard `is_idle()`。
+物理完成须核对 `sent_ap`/monitor 的预期数量及 scoreboard 排空，不能仅凭 `is_idle()` 判定。
 
 在 `10.11.10.53` 载入 VCS/UVM 1.2 与 license 环境后运行：
 
@@ -46,10 +46,20 @@ cfg 保持默认值，顶层 `#0; run_test();` 启动；agent 自动发布静态
 网络报文使用可选的 `eth_net_packet_pkg::eth_base_seq`：把
 `net_packet_pkg::packet.raw_data` 转成独立字节事务，保留协议头、payload 和 RoCEv2 ICRC，
 前导/Ethernet FCS 仍由 agent cfg 控制。支持直接设置 `seq.pkt` 后 `start(sqr)`，
-也支持派生 sequence 调用 `send_packet(pkt)`。完整编译顺序、接口和网络报文 Tcl 示例见
+支持 `count` 批量重放，或覆写 `create_packet()` 逐包生成；也可在业务 body 中调用 `send_packet(pkt)`。完整编译顺序、接口和网络报文 Tcl 示例见
 [net_packet 集成说明](docs/integration/net_packet.md)。验证入口：
 
 ```bash
 make net-packet-test NET_PACKET=/path/to/net_packet SEED=7
 make net-packet-aip-test NET_PACKET=/path/to/net_packet AIP_CORE=/path/to/aip_core SEED=7
+```
+
+`eth_base_seq` 还提供 subscribe/mon_xaction/unsubscribe，一次取得 Monitor 已组好的
+完整 Ethernet 帧。RM/SCB 使用 set_sequencer 关联长期对象；SCB 支持直接
+write_before/write_after，passive agent 同样可取包。用法、复位协调与完整示例见
+[整包采样及 RM/SCB 集成](docs/integration/sampling.md)。
+
+```bash
+make hub-test SEED=7
+make sampling-test NET_PACKET=/path/to/net_packet SEED=7
 ```

@@ -1,11 +1,13 @@
 // Agent 层：按 CLIENT/MAC 角色组合发送、接收和 ready 驱动，同时始终保留双向 monitor。
 // 配置由 env 或 bind module 预置；active 角色只申请自己拥有的引脚驱动权。
 // agent 拥有 driver/monitor/sequencer，connect 自动发布静态 sqr，final 撤销借用记录。
+// monitor_hub 永久拥有整包订阅缓存；passive 也创建 sequencer，但没有发送能力。
 class eth_seg_agent #(int RATE = 100) extends uvm_agent;
   `uvm_component_param_utils(eth_seg_agent#(RATE))
 
   eth_seg_config#(RATE) cfg;
   eth_seg_sequencer sequencer;
+  eth_seg_monitor_hub monitor_hub;
   eth_seg_tx_driver#(RATE) tx_driver;
   eth_seg_rx_driver#(RATE) rx_driver;
   eth_seg_ready_driver#(RATE) ready_driver;
@@ -33,9 +35,12 @@ class eth_seg_agent #(int RATE = 100) extends uvm_agent;
     rx_monitor = eth_seg_rx_monitor#(RATE)::type_id::create("rx_monitor", this);
     tx_monitor.cfg = cfg;
     rx_monitor.cfg = cfg;
+    monitor_hub = eth_seg_monitor_hub::type_id::create("monitor_hub", this);
+    sequencer = eth_seg_sequencer::type_id::create("sequencer", this);
+    // build 就关联句柄，兄弟 RM 在 connect 接入 reset_ap 时不依赖遍历顺序。
+    sequencer.monitor_hub = monitor_hub;
 
     if (cfg.is_active == UVM_ACTIVE) begin
-      sequencer = eth_seg_sequencer::type_id::create("sequencer", this);
       case (cfg.role)
         ETH_SEG_CLIENT: begin
           tx_driver = eth_seg_tx_driver#(RATE)::type_id::create("tx_driver", this);
@@ -61,8 +66,13 @@ class eth_seg_agent #(int RATE = 100) extends uvm_agent;
         tx_driver.seq_item_port.connect(sequencer.seq_item_export);
       else if (cfg.role == ETH_SEG_MAC && rx_driver != null)
         rx_driver.seq_item_port.connect(sequencer.seq_item_export);
-      eth_seg_sequencer::register_sqr(get_full_name(), sequencer);
     end
+    tx_monitor.item_collected_port.connect(monitor_hub.sample_tx);
+    rx_monitor.item_collected_port.connect(monitor_hub.sample_rx);
+    tx_monitor.reset_state_port.connect(monitor_hub.reset_tx);
+    rx_monitor.reset_state_port.connect(monitor_hub.reset_rx);
+    sequencer.can_send = (tx_driver != null || rx_driver != null);
+    eth_seg_sequencer::register_sqr(get_full_name(), sequencer);
   endfunction
 
   // UVM 结束时清除本 agent 的静态索引；组件对象仍由 UVM 管理生命周期。

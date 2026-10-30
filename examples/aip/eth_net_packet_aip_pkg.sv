@@ -9,10 +9,9 @@ package eth_net_packet_aip_pkg;
   import eth_net_packet_pkg::*;
   `include "uvm_macros.svh"
 
-  // 公共转换留在 eth_base_seq；此子类只决定报文内容和发送数量，便于业务继续扩展。
+  // count 和循环由 eth_base_seq 统一拥有；此层只决定逐包内容并通知 AIP 活动。
   class eth_net_packet_aip_seq extends eth_base_seq;
     `uvm_object_utils(eth_net_packet_aip_seq)
-    int count = 1;
 
     // count 由 aip_cmd_seq 设置；默认生成一帧 256B IPv4/UDP 报文。
     function new(string name = "eth_net_packet_aip_seq");
@@ -22,38 +21,34 @@ package eth_net_packet_aip_pkg;
     // 每帧按实际 agent 名字读取协议模板、长度及协议头参数，保证多 IP 参数隔离。
     // pkt_len 不含前导/Ethernet FCS；负值/超长或容纳不下协议头时在打包前失败。
     // load_params 后显式 do_pack，避免修改字段后继续使用旧 raw_data。
-    virtual task body();
-      eth_seg_sequencer sqr_handle;
+    virtual function packet create_packet(int unsigned packet_index);
+      eth_seg_sequencer sqr_handle = require_sqr(1);
+      packet generated;
       string param_path;
       byte unsigned payload_byte;
 
-      if (!$cast(sqr_handle, get_sequencer()) || sqr_handle == null) begin
-        `uvm_fatal("ETH_NET_AIP_SQR", "active named Ethernet sequencer is required")
-        return;
-      end
-      if (count <= 0) begin
-        `uvm_fatal("ETH_NET_AIP_COUNT", "count must be positive")
-        return;
-      end
+      if (sqr_handle == null) return null;
       param_path = sqr_handle.get_parent().get_full_name();
-      for (int n = 0; n < count; n++) begin
-        pkt = new();
-        pkt.build_from_template(ETH_IPV4_UDP);
-        pkt.pkt_len = 256;
-        pkt.load_params(param_path);
-        `aip_int(param_path, byte unsigned, payload_byte, 8'ha5)
-        pkt.payload_mode = PAYLOAD_FIXED;
-        pkt.payload_fixed_val = payload_byte;
-        if (pkt.pkt_len < 14 || pkt.pkt_len > 16384 ||
-            pkt.pkt_len < pkt.get_all_headers_length() + pkt.get_all_trailers_length()) begin
-          `uvm_fatal("ETH_NET_AIP_LENGTH", "pkt_len must be 14..16384 and contain the complete protocol stack")
-          return;
-        end
-        pkt.do_pack();
-        send_packet(pkt);
-        aip_activity::tick();
+      generated = new();
+      generated.build_from_template(ETH_IPV4_UDP);
+      generated.pkt_len = 256;
+      generated.load_params(param_path);
+      `aip_int(param_path, byte unsigned, payload_byte, 8'ha5)
+      generated.payload_mode = PAYLOAD_FIXED;
+      generated.payload_fixed_val = payload_byte;
+      if (generated.pkt_len < 14 || generated.pkt_len > 16384 ||
+          generated.pkt_len < generated.get_all_headers_length() + generated.get_all_trailers_length()) begin
+        `uvm_fatal("ETH_NET_AIP_LENGTH", "pkt_len must be 14..16384 and contain the complete protocol stack")
+        return null;
       end
-    endtask
+      generated.do_pack();
+      return generated;
+    endfunction
+
+    // 成功入队才报告活动；此通知不承担 Monitor 的物理完成语义。
+    virtual function void packet_queued(int unsigned packet_index);
+      aip_activity::tick();
+    endfunction
   endclass
 
   // 查询表达式在 Tcl 命令执行时求值，必须在 UVM connect 完成后运行 bridge。

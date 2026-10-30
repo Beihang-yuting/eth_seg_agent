@@ -10,6 +10,12 @@
 
 **Spec:** [已确认的设计](../specs/2026-10-30-eth-whole-packet-sampling-design.md)。产品基线 `26abff6`，设计提交 `83838af`。
 
+**执行记录：** 用户选择主会话实现与审查、测试代理在 53 执行 VCS。功能已实现，
+最终快照回归、第二个随机种子、测试告警修正复测及提交检查均已通过。
+按依赖合并了部分任务的提交和验证；hub 保留实现前红测，
+bind/count 未分别运行实现前红测，下面明确记录这两处执行调整。实际证据以
+[验证记录](../../development/sampling-validation.md) 为准。
+
 ## Global Constraints
 
 - 直接扩展现有 `eth_base_seq`，不增加另一层公共 sequence 父类。
@@ -89,7 +95,7 @@ function void write_sample_reset_rx(bit asserted);
 输出 `uvm_analysis_port#(eth_seg_reset_notice_t) reset_ap`；`pending` 对不存在的订阅
 报告配置错误，`is_idle` 汇总所有订阅槽。取消不存在的订阅是无副作用操作。
 
-- [ ] **Step 1：加入独立字节和对象隔离检查。** 在测试 build 创建 hub，run 使用
+- [x] **Step 1：加入独立字节和对象隔离检查。** 在测试 build 创建 hub，run 使用
   以下输入，不通过 codec、driver 或被测 sequence 生成期望：
 
 ```systemverilog
@@ -115,15 +121,15 @@ a.frame_bytes[0] = 255;
 if (b.frame_bytes[0] != 17) `uvm_fatal("HUB_TEST", "consumer modified another copy")
 ```
 
-- [ ] **Step 2：加入 Makefile 定向入口并在 53 首次运行。** 新目标 `hub-test` 转发到
+- [x] **Step 2：加入 Makefile 定向入口并在 53 首次运行。** 新目标 `hub-test` 转发到
   `hub-run BUILD=build/sampling_hub`；源码顺序为 interface、types、eth_seg_pkg、
   eth_seg_hub_test_pkg、tb_hub；top 为 tb_hub，完成标志 `ETH_HUB_TEST_COMPLETE`。
   在尚未实现 hub 时，`make hub-test SEED=7` 应因缺失类型/API 编译失败。
 
-- [ ] **Step 3：实现每个订阅独立的槽对象及广播。** 同文件内的内部类
+- [x] **Step 3：实现每个订阅独立的槽对象及广播。** 同文件内的内部类
   `eth_seg_subscription` 保存
   `eth_seg_seq_item frames[$]`、`int unsigned depth`、`bit active=1`、`process reader`。
-  hub 使用 `slots[eth_seg_dir_e][int unsigned]` 存槽句柄；取消时先设置 active=0，
+  hub 使用 `slots[2][int unsigned]` 存槽句柄，方向枚举经校验后索引；取消时先设置 active=0，
   再清空并移除索引；重新订阅创建新槽。每个订阅逐一创建 item 并 copy 后入队：
 
 ```systemverilog
@@ -137,37 +143,50 @@ slot.frames.push_back(copy);
   `ETH_SAMPLE_SUB`；空发布输入报告 `ETH_SAMPLE_NULL`；容量溢出报告
   `ETH_SAMPLE_OVERFLOW` 并保持原队列不变。无订阅的合法发布不缓存。
 
-- [ ] **Step 4：实现等待、取消和读取进程清理。** 将调用者 process::self() 存入槽，
-  对已有且未 FINISHED/KILLED 的 reader 报 `ETH_SAMPLE_READER`。以下等待体放在
-  一个独立子进程内，disable fork 只清理本次 timeout，不能杀死用户其它线程：
+- [x] **Step 4：实现等待、取消和读取进程清理。** 将调用者 process::self() 存入槽，
+  对已有且未 FINISHED/KILLED 的 reader 报 `ETH_SAMPLE_READER`。每次唤醒后重新
+  检查取消、队列和原截止时间，避免同一时刻复位删包后误报超时。以下内层等待放在
+  独立子进程内，disable fork 只清理本次等待，不能杀死用户其它线程：
 
 ```systemverilog
+time started, remaining;
 tr = null;
-fork
-  begin
-    fork
-      wait (!slot.active || slot.frames.size() != 0);
-      begin
-        if (timeout != 0) #(timeout);
-        else wait (1'b0);
-      end
-    join_any
-    disable fork;
+started = $time;
+forever begin
+  if (!slot.active) begin
+    slot.reader = null;
+    return;
   end
-join
-slot.reader = null;
-if (!slot.active) return;
-if (slot.frames.size() != 0) begin
-  tr = slot.frames.pop_front();
-  return;
+  if (slot.frames.size() != 0) begin
+    tr = slot.frames.pop_front();
+    slot.reader = null;
+    return;
+  end
+  if (timeout != 0 && $time-started >= timeout) begin
+    slot.reader = null;
+    `uvm_error("ETH_SAMPLE_TIMEOUT", "no complete frame before timeout")
+    return;
+  end
+  remaining = timeout == 0 ? 0 : timeout-($time-started);
+  fork
+    begin
+      fork
+        wait (!slot.active || slot.frames.size() != 0);
+        begin
+          if (timeout != 0) #(remaining);
+          else wait (1'b0);
+        end
+      join_any
+      disable fork;
+    end
+  join
 end
-`uvm_error("ETH_SAMPLE_TIMEOUT", "no complete frame before timeout")
 ```
 
   reader 赋值和校验在 fork 前完成；禁止定时轮询。核对 VCS 对队列 size 的 wait
   唤醒行为；必要时用“先检查条件再等待”的状态计数通知实现同一语义。
 
-- [ ] **Step 5：实现方向复位并完成负向测试。** hub 每方向保存已知状态、当前状态、
+- [x] **Step 5：实现方向复位并完成负向测试。** hub 每方向保存已知状态、当前状态、
   epoch。首次通知同步状态；首次断言及后续断言边沿 epoch 加一，清空该方向队列，
   不删除订阅；释放时保留 epoch。重复状态不重复发布 reset_ap。
   hub 的状态更新/队列清理完成后才发布通知，避免回调看到旧数据。
@@ -193,7 +212,7 @@ if (a == null) `uvm_fatal("HUB_TEST", "reader did not recover after reset")
   将 source.aborted、CRC 和错误边带设置为非默认值后发布，核对完整事务的状态
   不被过滤或丢失。复位等待测试还须核对原始 timeout 截止时间不被复位重启。
 
-- [ ] **Step 6：53 运行并审查本任务。** `make hub-test SEED=7` 必须完整结束、
+- [x] **Step 6：53 运行并审查本任务。** `make hub-test SEED=7` 必须完整结束、
   所有精确负向计数符合预期、零意外 ERROR/FATAL。审阅完整新增文件及 include 顺序，
   记录定向结果；提交 `feat: add whole-packet monitor subscriptions`。
 
@@ -206,7 +225,7 @@ if (a == null) `uvm_fatal("HUB_TEST", "reader did not recover after reset")
 unsubscribe 三个同签名接口。Monitor 新增 `uvm_analysis_port#(bit) reset_state_port`，
 1 代表复位断言。句柄缺失报告 `ETH_SAMPLE_HUB`。
 
-- [ ] **Step 1：修改 bind 的 passive 检查并加入实际整包采样。** 原检查中的
+- [x] **Step 1：修改 bind 的 passive 检查并加入实际整包采样。** 原检查中的
   `observer.sequencer != null` 改成检查其必须存在且 can_send=0；全部 driver
   必须仍为 null。在 end_of_elaboration 检查静态查询得到该 sequencer，订阅双向。
 
@@ -222,10 +241,11 @@ observer.sequencer.subscribe(ETH_SEG_RX, 0);
   使用现有 prepare_frames 的输入快照，分别消费 FRAME_COUNT 个 TX/RX 整包并逐字节
   核对；与现有六个 analysis sink 同时运行，不以两个被测路径互相比对代替独立期望。
 
-- [ ] **Step 2：在 53 确认新 passive 检查失败。** 运行 `make bind-test SEED=7`，
-  在实现前预期缺少字段/API 或 passive sequencer 为空，不接受其它错误作为预期失败。
+- **Step 2（执行调整，未单独运行红测）：** 原计划在实现前运行 bind-test，
+  预期缺少 API 或 passive sequencer 为空。实际在连接实现后首次运行，
+  green2 和最终回归验证 passive 整包读取及无 driver；不声明存在独立 bind 红测。
 
-- [ ] **Step 3：实现始终存在的 hub/sqr 及连接。** build 创建双向 Monitor、hub 和
+- [x] **Step 3：实现始终存在的 hub/sqr 及连接。** build 创建双向 Monitor、hub 和
   sequencer，立即设置 sequencer.monitor_hub，供其它组件 connect 时安全借用；
   active 分支仍只创建角色对应 driver。connect 先连接 driver，再设置 can_send，
   双向 analysis 和复位端口连接如下，最后登记 static sqr：
@@ -245,12 +265,12 @@ eth_seg_sequencer::register_sqr(get_full_name(), sequencer);
   不提前在 build 登记静态句柄。转发方法先校验 hub 非空，错误返回不再继续访问。
   `mon_xaction` 在任何失败路径先置输出 tr=null。
 
-- [ ] **Step 4：增加 Monitor 复位通知。** 在各自 clocking block 唤醒后、原有复位
+- [x] **Step 4：增加 Monitor 复位通知。** 在各自 clocking block 唤醒后、原有复位
   和 valid 判断之前，首次采样及状态变化时写 reset_state_port。通知条件和现有
   低有效复位判定一致，不修改 ready 历史、segment 算法、无效拍或格式解码。
   每个 Monitor 只通知自己的方向，不从 TX 线程推断 RX 状态。
 
-- [ ] **Step 5：运行绑定和时序定向检查。** 53 执行 `make bind-test SEED=7`、
+- [x] **Step 5：运行绑定和时序定向检查。** 53 执行 `make bind-test SEED=7`、
   `make timing-test SEED=7`；确保三速率 passive 实际取包、双向 payload 和边带正确，
   active driver 所有权及 ready 两拍关系保持。审阅完整触及文件后提交
   `feat: expose monitor sampling on active and passive sequencers`。
@@ -273,7 +293,7 @@ virtual function void packet_queued(int unsigned packet_index);
 `ETH_NET_SQR`、`ETH_NET_PASSIVE`。默认 packet_queued 无副作用。公共采样方法
 与 Task 1 完全相同，先 require_sqr(0)，再调用 sequencer 方法。
 
-- [ ] **Step 1：加入批量与采样测试。** 在原三速率四格式 case 中创建持久采样 seq，
+- [x] **Step 1：加入批量与采样测试。** 在原三速率四格式 case 中创建持久采样 seq，
   通过 set_sequencer 关联对端，订阅后才启动流量。既有 8 TX+8 RX 内容检查保留。
   新增显式 pkt/count=3、无 pkt/count=3，以及逐包不同 MAC 的派生生成器：
 
@@ -295,11 +315,11 @@ endfunction
   same_cycle_boundaries 增量大于零且订阅按线序返回全部 32 包。其它 case 保留
   跨周期长包、周期和随机 ready/valid、固定及随机负载；记录实际命中的节奏场景。
 
-- [ ] **Step 2：53 运行新增定向测试，确认当前实现不能满足 count/采样断言。**
-  命令为 `make net-packet-test NET_PACKET="$ETH_NET_DEP" SEED=7`，
-  ETH_NET_DEP 的具体路径见 Task 7。负向检查须有整体仿真超时。
+- **Step 2（执行调整，未单独运行红测）：** 批量测试在实现后首次运行，
+  green3 两种子及最终回归验证逐字节期望和 count/type/passive/生成器负向诊断；
+  不声明存在独立 count 红测。所有阻塞调用仍有整体仿真超时保护。
 
-- [ ] **Step 3：实现默认生成器和唯一批量循环。** create_packet 每次 new 独立 packet，
+- [x] **Step 3：实现默认生成器和唯一批量循环。** create_packet 每次 new 独立 packet，
   构造 ETH_IPV4_UDP、pkt_len=256、PAYLOAD_FIXED、payload_fixed_val=0xa5，再 do_pack。
   body 的控制结构如下；所有新函数/task 前添加中文契约说明：
 
@@ -328,11 +348,11 @@ endtask
   类型 package 显式 import eth_seg_types_pkg，不能假定 import 会被其它 package 转导出。
   负向测试捕获 fatal 后，错误路径必须显式返回，禁止进入 item 握手或继续访空。
 
-- [ ] **Step 4：实现采样转发，并证明采样不会误发包。** 示例采样对象只
+- [x] **Step 4：实现采样转发，并证明采样不会误发包。** 示例采样对象只
   set_sequencer、subscribe、mon_xaction；记录前后 driver 计数无增加。
   无额外 sequence 父类、无 load_send_config、无 AIP import。
 
-- [ ] **Step 5：53 验证三速率四格式及转换边界。** 默认返回不含前导/FCS，FCS
+- [x] **Step 5：53 验证三速率四格式及转换边界。** 默认返回不含前导/FCS，FCS
   开启时采样保留尾四字节和状态，短包、VLAN、RoCEv2 ICRC 等原覆盖继续通过。
   审阅完整文件后提交 `feat: add batch sending and whole-packet sampling to eth_base_seq`。
 
@@ -345,7 +365,7 @@ endtask
 `function void flush_direction(eth_seg_dir_e dir)`；前两者使用原 TX 队列。
 清理仅删除指定方向的 expected/actual 队列，matched/mismatch 累计统计不清零。
 
-- [ ] **Step 1：加入 arrival-order、复制和 reset 检查。** 测试中在 build 创建 sb，
+- [x] **Step 1：加入 arrival-order、复制和 reset 检查。** 测试中在 build 创建 sb，
   使用 Task 1 的独立字节对象；检查实际先到也能在期望到达后比较：
 
 ```systemverilog
@@ -362,7 +382,7 @@ if (!sb.is_idle() || sb.matched_tx != 1)
   `uvm_fatal("SB_API_TEST", "flush changed counters or retained items")
 ```
 
-- [ ] **Step 2：实现 wrappers、校验及清理。** wrappers 调用 write_expect_tx/
+- [x] **Step 2：实现 wrappers、校验及清理。** wrappers 调用 write_expect_tx/
   write_actual_tx；四个原入口均拒绝 null，报告 `ETH_SEG_SB_NULL` 后返回。
   flush_direction 用 case 选择 TX/RX 两个 FIFO；其它值报 `ETH_SEG_SB_DIR`。
   不修改现有匹配规则，也不因为 actual 先到就报告 mismatch。
@@ -376,7 +396,7 @@ function void write_after(eth_seg_seq_item item);
 endfunction
 ```
 
-- [ ] **Step 3：完成定向验证。** 53 运行 `make hub-test SEED=7`；补充期望先到、
+- [x] **Step 3：完成定向验证。** 53 运行 `make hub-test SEED=7`；补充期望先到、
   修改实际字节产生 `ETH_SEG_SB_TX`、check_phase 剩余产生
   `ETH_SEG_SB_TX_REMAINDER` 的精确负向测试；验证 flush TX 不删除 RX 队列。
   验证后提交 `feat: add direct scoreboard input and explicit reset cleanup`。
@@ -388,12 +408,12 @@ endfunction
 **Interfaces:** 使用 Task 3 的 inherited count、create_packet、packet_queued；保留
 四个 ethN_net_send 命令名称和 `aip_cmd_seq` 注册方式。
 
-- [ ] **Step 1：扩展持久采样测试。** AIP test 为每个 agent 建一个长期采样 seq，
+- [x] **Step 1：扩展持久采样测试。** AIP test 为每个 agent 建一个长期采样 seq，
   end_of_elaboration 注册，运行时消费 TX 整包；Tcl 第一次 count=2，改参数后第二次
   count=1，验证该订阅累计收到三包，且其它 IP 各自数量和内容正确。
   原独立 eth_net_sink 继续比较，两个观测消费者不能共享可变事务。
 
-- [ ] **Step 2：把原 body 的逐包构造改成 create_packet。** 使用局部 packet p、
+- [x] **Step 2：把原 body 的逐包构造改成 create_packet。** 使用局部 packet p、
   require_sqr(1) 得到实际 agent 参数前缀；长度、模板及协议字段继续在每次构造时读取：
 
 ```systemverilog
@@ -416,11 +436,11 @@ return p;
   删去子类 count 和 body。覆写 `packet_queued(int unsigned packet_index)`，函数体
   调用 `aip_activity::tick()`。不新增解析任意命令参数的代码。
 
-- [ ] **Step 3：保护原始帧 Tcl 入口。** eth_seg_aip_frame_seq 在 `$cast` 成功后检查
+- [x] **Step 3：保护原始帧 Tcl 入口。** eth_seg_aip_frame_seq 在 `$cast` 成功后检查
   sqr_handle.can_send；passive 报 `ETH_AIP_PASSIVE` 并 return。其原 count 循环保留，
   因为它继承的是 eth_seg_base_seq，不是 eth_base_seq。原错误路径补显式返回。
 
-- [ ] **Step 4：在 53 运行真实 UCLI。**
+- [x] **Step 4：在 53 运行真实 UCLI。**
 
 ```bash
 make net-packet-aip-test NET_PACKET="$ETH_NET_DEP" AIP_CORE="$ETH_AIP_DEP" SEED=7
@@ -446,19 +466,19 @@ make aip-test AIP_CORE="$ETH_AIP_DEP" SEED=7
 复位协调另保存 `bit subscribed`、`bit reset_seen[2]` 和
 `bit reset_asserted[2]`；首次观察到两个方向的状态后才允许启动工作进程。
 
-- [ ] **Step 1：构造独立刺激测试。** HDL 测试提供 100/200/400 三条 link，MAC agent
+- [x] **Step 1：构造独立刺激测试。** HDL 测试提供 100/200/400 三条 link，MAC agent
   产生 DUT 入口，测试专用 CLIENT agent 按预先构造的输出字节脚本产生出口。
   它是演示用刺激模型，不作为用户 DUT 正确性的证明；expected 只来自采样 RX 的 RM。
   独立输出脚本与输入 packet 快照对应，禁止从 hub 或 RM 的结果反向生成 actual。
   顶层复位可由测试控制；pin checker 继续检查接口时序。
 
-- [ ] **Step 2：实现查找和初始化。** 示例 build 只创建自身 sb 和两个采样对象。
+- [x] **Step 2：实现查找和初始化。** 示例 build 只创建自身 sb 和两个采样对象。
   connect 用 `uvm_root::get().find({agent_name, ".sequencer"})` cast 成非参数化 sqr，
   连接 sqr.monitor_hub.reset_ap 到示例的 reset analysis_imp；此时所有组件已 build，
   不依赖兄弟 agent 的静态表登记顺序。end_of_elaboration 再核对 get_sqr 返回同一对象，
   两个采样 seq.set_sequencer(sqr)，在发包前注册 RX/TX。错误名字立即 fatal。
 
-- [ ] **Step 3：实现两条独立消费线程。** 以下线程属于示例工作进程，采样对象
+- [x] **Step 3：实现两条独立消费线程。** 以下线程属于示例工作进程，采样对象
   不调用 start；预测延时可由 task 覆写，以验证 actual-first：
 
 ```systemverilog
@@ -486,7 +506,7 @@ join
   保存工作进程句柄，两个循环为该进程的子进程；SCB 比较累计数由 test 根据当前
   epoch 的基准计算，不能每次复位清除全部历史统计。
 
-- [ ] **Step 4：实现示例的整条链路复位协调。** reset analysis 回调是 function，
+- [x] **Step 4：实现示例的整条链路复位协调。** reset analysis 回调是 function，
   只更新状态、kill 工作进程、取消两个订阅、flush TX 比较队列；禁止在回调中 wait。
   RX 或 TX 任一方向断言都执行该链路清理。释放后，run 中协调线程等两个方向
   状态都已知且都非复位，只在 subscribed=0 时注册，再创建新的工作进程并置
@@ -507,14 +527,14 @@ subscribed = 0;
   全部丢弃”策略。test 必须等待 sampling_ready 才启动新批次，以免重订阅前丢观察包。
   此处 ready 是示例运行期采样状态，不是 bind time-zero 初始化标记。
 
-- [ ] **Step 5：加入可判错的场景与终止条件。** 一个场景先输出后完成 RM 预测，
+- [x] **Step 5：加入可判错的场景与终止条件。** 一个场景先输出后完成 RM 预测，
   一个场景先预测后输出；故意改一个出口字节须捕获一次 ETH_SEG_SB_TX。
   复位场景先让 RM 持有一个等待中的输入、hub 留一个完整包、Monitor 留半包，再
   断言复位，释放后发送内容明显不同的新批次，核对不存在跨 epoch 比较。
   完成条件要求预期包数、matched 差值、driver/Monitor idle、hub pending=0、
   RM 无在途预测、sb.is_idle，并设置 100us 整体超时。
 
-- [ ] **Step 6：53 验证并完成用户文档。** 新目标 `sampling-test` 转发到
+- [x] **Step 6：53 验证并完成用户文档。** 新目标 `sampling-test` 转发到
   `sampling-run BUILD=build/sampling`，沿用 NET_SRC/NET_INC 并编译示例和测试，
   top=tb_rm_scb，完成标志 `ETH_SAMPLING_TEST_COMPLETE`。运行：
 
@@ -533,7 +553,7 @@ make sampling-test NET_PACKET="$ETH_NET_DEP" SEED=7
 **Files:** 新建 `docs/development/sampling-validation.md`；日志放在忽略目录
 `results/sampling_validation/`。不创建包含登录凭据的脚本。
 
-- [ ] **Step 1：准备干净的远程运行目录。** 在 53 新建本任务目录，仅同步 tracked
+- [x] **Step 1：准备干净的远程运行目录。** 在 53 新建本任务目录，仅同步 tracked
   源码和本次明确新增的实现文件。使用已有依赖并记录 git rev-parse HEAD：
 
 ```bash
@@ -545,7 +565,7 @@ export ETH_AIP_DEP=/home/ubuntu/ryan/eth_sgment_runs/aip-core-update-cd339ef
   aip_core=cd339eff8d4b0982be885a0a71f3e593a4aed239；不同则记录并调查，不能偷偷替换依赖。
   本任务执行所有 VCS 命令前使用加载了 ~/.bashrc 的 bash，确认 vcs 和 license 可用。
 
-- [ ] **Step 2：完成尚未覆盖的回归。** 任务内已在最终相同源码上通过的定向测试
+- [x] **Step 2：完成尚未覆盖的回归。** 任务内已在最终相同源码上通过的定向测试
   直接复用日志；源码再次变动时只重跑受影响目标。命令清单如下：
 
 ```bash
@@ -565,12 +585,12 @@ make timing-checker-test
   net_packet 两个种子验证随机节奏下的新增采样路径。timing-checker 按现有七个
   精确场景判定。每个目标都检查完成标志、完整 summary 和意外错误数。
 
-- [ ] **Step 3：核对设计覆盖并记录证据。** 汇总实际用例数、各方向收包数、
+- [x] **Step 3：核对设计覆盖并记录证据。** 汇总实际用例数、各方向收包数、
   subscribed/consumed/reset-discard/overflow 等测试统计；对照设计第 7 节逐项列出
   证据目标。统计从日志读取，不能预先填入计划中的期望值作为实际结果。
   文档记下源码提交/快照、依赖、VCS 版本、种子、命令、失败修复及最终日志路径。
 
-- [ ] **Step 4：完整技术审查并提交。** 主会话检查涉及目录内的源码全文与示例，
+- [x] **Step 4：完整技术审查并提交。** 主会话检查涉及目录内的源码全文与示例，
   包括未直接修改但与本次数据流相连的 driver、codec、env：
   对象复制、读者进程死亡、取消后的旧槽、复位通知顺序、跨方向清理、body/count
   继承、raw_data 更新、passive 无驱动和准确中文注释。运行 `git diff --check`，
@@ -592,6 +612,6 @@ make timing-checker-test
 
 ## 实施方式选择
 
-建议在当前会话按任务顺序执行，主会话写代码及审查，沿用已有测试代理完成 53
-上的 VCS 验证；另一种方式是按任务分派实现代理并逐项审查，仍遵守 AGENTS.md
-的模型分工。用户审阅本计划并选择后开始产品代码实现。
+用户已选择在当前会话实施：主会话写代码及审查，沿用已有测试代理完成 53
+上的 VCS 验证，遵守 AGENTS.md 的模型分工。交付保留在当前功能分支，
+远程发布按用户后续指令处理。

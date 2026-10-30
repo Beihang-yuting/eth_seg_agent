@@ -80,6 +80,7 @@ package eth_seg_bind_test_pkg;
     eth_seg_config#(RATE) published_cfg;
     virtual eth_seg_if#(RATE) published_vif;
     bind_packet_sink tx_sink[3], rx_sink[3];
+    bind_packet_sink sampled_tx, sampled_rx;
     bind_frame_sequence tx_seq, rx_seq;
     bit done = 0;
 
@@ -146,6 +147,8 @@ package eth_seg_bind_test_pkg;
           mac.cfg.rx_valid_pattern != mac.cfg.ready_pattern ||
           mac.cfg.random_load != (RATE == 400) || client.cfg.traffic_load_pct != ((RATE == 400) ? 50 : 100))
         `uvm_fatal("BIND_CONFIG", "user cfg adjustment differs")
+      sampled_tx = new("sampled_tx", this);
+      sampled_rx = new("sampled_rx", this);
       foreach (tx_sink[i]) begin
         tx_sink[i] = new($sformatf("tx_sink%0d", i), this);
         rx_sink[i] = new($sformatf("rx_sink%0d", i), this);
@@ -165,7 +168,7 @@ package eth_seg_bind_test_pkg;
       end
       if (client.tx_driver == null || client.rx_driver != null || client.ready_driver != null ||
           mac.tx_driver != null || mac.rx_driver == null || mac.ready_driver == null ||
-          observer.sequencer != null || observer.tx_driver != null ||
+          observer.sequencer == null || observer.sequencer.can_send || observer.tx_driver != null ||
           observer.rx_driver != null || observer.ready_driver != null)
         `uvm_fatal("BIND_ROLE", "incorrect active/passive driver construction")
     endfunction
@@ -193,6 +196,8 @@ package eth_seg_bind_test_pkg;
         eth_seg_codec::encode(item, client.cfg.preamble_passthrough, client.cfg.include_fcs, bytes);
         exp.frame_bytes = new[bytes.size() - pre_bytes];
         foreach (exp.frame_bytes[b]) exp.frame_bytes[b] = bytes[b + pre_bytes];
+        if (is_rx) sampled_rx.expect_packet(exp);
+        else sampled_tx.expect_packet(exp);
         foreach (tx_sink[i]) begin
           if (is_rx) rx_sink[i].expect_packet(exp);
           else tx_sink[i].expect_packet(exp);
@@ -205,24 +210,39 @@ package eth_seg_bind_test_pkg;
       foreach (tx_sink[i])
         if (tx_sink[i].received != FRAME_COUNT || rx_sink[i].received != FRAME_COUNT ||
             tx_sink[i].expected.size() || rx_sink[i].expected.size()) return 0;
-      return 1;
+      return sampled_tx.received == FRAME_COUNT && sampled_rx.received == FRAME_COUNT;
     endfunction
+
+    // passive 的 sequencer 获取真实线上的整包；和原 analysis 接收器用同一独立输入期望。
+    task consume_samples(bit is_rx);
+      eth_seg_seq_item item;
+      repeat (FRAME_COUNT) begin
+        observer.sequencer.mon_xaction(item, is_rx ? ETH_SEG_RX : ETH_SEG_TX, 0, 10us);
+        if (item == null) `uvm_fatal("BIND_SAMPLE", "passive sampling returned no packet")
+        if (is_rx) sampled_rx.write(item);
+        else sampled_tx.write(item);
+      end
+    endtask
 
     // 等复位解除后启动双向流；设置周期上限并检查尾部无幽灵包、无未完报文。
     // 所有 case 由 test 的单一 objection 包住，本组件不单独控制仿真生命周期。
     task run_phase(uvm_phase phase);
       if (eth_seg_sequencer::get_sqr(client.get_full_name()) != client.sequencer ||
           eth_seg_sequencer::get_sqr(mac.get_full_name()) != mac.sequencer ||
-          eth_seg_sequencer::get_sqr(observer.get_full_name()) != null ||
+          eth_seg_sequencer::get_sqr(observer.get_full_name()) != observer.sequencer ||
           eth_seg_sequencer::get_sqr("missing_agent") != null)
-        `uvm_fatal("BIND_SQR", "static sequencer registry differs or passive was registered")
+        `uvm_fatal("BIND_SQR", "static sequencer registry differs")
       wait (client.cfg.vif.i_tx_rst_n && mac.cfg.vif.i_rx_rst_n);
       @(posedge client.cfg.vif.i_clk_tx);
       tx_seq = new("tx_seq");
       rx_seq = new("rx_seq");
       prepare_frames(tx_seq, 0);
       prepare_frames(rx_seq, 1);
+      observer.sequencer.subscribe(ETH_SEG_TX);
+      observer.sequencer.subscribe(ETH_SEG_RX);
       fork
+        consume_samples(0);
+        consume_samples(1);
         tx_seq.start(eth_seg_sequencer::get_sqr(client.get_full_name()));
         rx_seq.start(eth_seg_sequencer::get_sqr(mac.get_full_name()));
       join
@@ -238,6 +258,8 @@ package eth_seg_bind_test_pkg;
           observer.cfg.vif.tx_drive_enabled || observer.cfg.vif.rx_drive_enabled || observer.cfg.vif.ready_drive_enabled)
         `uvm_fatal("BIND_OWNERSHIP", "wrong interface drive ownership")
       `uvm_info("BIND_RATE_PASS", $sformatf("RATE=%0d: 8 TX + 8 RX frames matched on all 3 agents", RATE), UVM_LOW)
+      observer.sequencer.unsubscribe(ETH_SEG_TX);
+      observer.sequencer.unsubscribe(ETH_SEG_RX);
       done = 1;
     endtask
   endclass
@@ -270,8 +292,8 @@ package eth_seg_bind_test_pkg;
       fork : completion_or_timeout
         begin
           wait (case100.done && case200.done && case400.done && case100b.done);
-          if (eth_seg_sequencer::sqr.num() != 8)
-            `uvm_fatal("BIND_SQR_COUNT", "four links must publish eight independent active sequencers")
+          if (eth_seg_sequencer::sqr.num() != 12)
+            `uvm_fatal("BIND_SQR_COUNT", "four links must publish twelve independent active/passive sequencers")
           `uvm_info("ETH_BIND_TEST_COMPLETE", "all bind integration checks completed", UVM_NONE)
         end
         begin

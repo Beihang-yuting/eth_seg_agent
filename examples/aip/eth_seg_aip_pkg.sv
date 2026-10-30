@@ -24,15 +24,26 @@ package eth_seg_aip_pkg;
       eth_seg_sequencer sqr_handle;
       string param_path;
       int unsigned frame_length;
-      if (!$cast(sqr_handle, get_sequencer()) || sqr_handle == null)
+      if (!$cast(sqr_handle, get_sequencer()) || sqr_handle == null) begin
         `uvm_fatal("ETH_AIP_SQR", "named active sequencer is not registered")
-      if (count <= 0) `uvm_fatal("ETH_AIP_COUNT", "count must be positive")
+        return;
+      end
+      if (!sqr_handle.can_send) begin
+        `uvm_fatal("ETH_AIP_PASSIVE", "passive sequencer cannot send frames")
+        return;
+      end
+      if (count <= 0) begin
+        `uvm_fatal("ETH_AIP_COUNT", "count must be positive")
+        return;
+      end
       param_path = sqr_handle.get_parent().get_full_name();
       for (int unsigned n = 0; n < count; n++) begin
         eth_seg_seq_item item;
         `aip_int(param_path, int unsigned, frame_length, 256)
-        if (frame_length < 9 || frame_length > 16384)
+        if (frame_length < 9 || frame_length > 16384) begin
           `uvm_fatal("ETH_AIP_LENGTH", "frame_length must be 9..16384 bytes")
+          return;
+        end
         item = eth_seg_seq_item::type_id::create($sformatf("frame_%0d", n));
         make_frame(item, frame_length, n);
         start_item(item);

@@ -3,6 +3,7 @@
 // 本层只声明 sequence 类型，报文归调用方，转换生成的事务归 sequence/driver 管理。
 package eth_net_packet_pkg;
   import uvm_pkg::*;
+  import eth_seg_types_pkg::*;
   import eth_seg_pkg::*;
   `include "uvm_macros.svh"
 

@@ -1,4 +1,5 @@
 // src 观察层：RX segmented MAC 引脚监视器。
+// reset_state_port 发布本方向复位变化；组件拥有半包，hub 拥有已完成包的订阅副本。
 // 组件只在 o_rx_mac_valid 为 1 时消费各 segment；invalid 拍完全忽略数据和边带，
 // 因而可跨任意气泡保存当前包。EOP 段提取 empty、fcs_error、error、status_data，
 // 合法 CRC 错误通过事务字段传播而不触发 uvm_error；复位中断包计入 aborted_packets。
@@ -8,6 +9,8 @@ class eth_seg_rx_monitor #(int RATE = 100) extends uvm_component;
   eth_seg_config#(RATE) cfg;
   virtual eth_seg_if#(RATE) vif;
   uvm_analysis_port#(eth_seg_seq_item) item_collected_port;
+  uvm_analysis_port#(bit) reset_state_port;
+  bit reset_observed, previous_reset;
   int unsigned packets_seen, aborted_packets, valid_cycles, invalid_cycles;
   int unsigned idle_segments, data_segments, bytes_seen, same_cycle_boundaries;
 
@@ -20,6 +23,7 @@ class eth_seg_rx_monitor #(int RATE = 100) extends uvm_component;
   function new(string name = "eth_seg_rx_monitor", uvm_component parent = null);
     super.new(name, parent);
     item_collected_port = new("item_collected_port", this);
+    reset_state_port = new("reset_state_port", this);
   endfunction
 
   // 取得父 agent 提供的配置和虚接口，缺失时立即终止以避免静默空循环。
@@ -71,6 +75,13 @@ class eth_seg_rx_monitor #(int RATE = 100) extends uvm_component;
     bit ended_this_cycle;
     forever begin
       @(vif.rx_cb);
+      // 同一采样域首次同步及复位边沿通知；先清理 hub，再消费本拍数据。
+      // X 复位由接口检查负责，此处只将确定的低电平视为断言。
+      if (!reset_observed || previous_reset != (vif.rx_cb.i_rx_rst_n === 1'b0)) begin
+        reset_observed = 1;
+        previous_reset = (vif.rx_cb.i_rx_rst_n === 1'b0);
+        reset_state_port.write(previous_reset);
+      end
       if (!vif.rx_cb.i_rx_rst_n) begin
         if (in_packet) aborted_packets++;
         in_packet = 0;

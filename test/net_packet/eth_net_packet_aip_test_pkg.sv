@@ -7,6 +7,7 @@ package eth_net_packet_aip_test_pkg;
   import net_packet_pkg::*;
   import eth_seg_pkg::*;
   import eth_seg_types_pkg::*;
+  import eth_net_packet_pkg::*;
   import eth_net_packet_aip_pkg::*;
   import eth_net_packet_test_pkg::*;
   `include "uvm_macros.svh"
@@ -14,7 +15,8 @@ package eth_net_packet_aip_test_pkg;
   // 每个 port 只借用已绑定 agent，持有独立 monitor sink 和期望计数。
   class eth_net_aip_port #(int RATE = 100) extends uvm_component;
     eth_seg_agent#(RATE) agt;
-    eth_net_sink sink;
+    eth_net_sink sink, sampled;
+    eth_base_seq sampler;
     int expected_count = 0;
 
     // 名字与 AGENT_NAME 一致；sink 在 build 阶段创建。
@@ -30,6 +32,8 @@ package eth_net_packet_aip_test_pkg;
       if (agt.cfg.role != ETH_SEG_CLIENT || agt.cfg.preamble_passthrough || agt.cfg.include_fcs)
         `uvm_fatal("ETH_NET_AIP_DEFAULT", "bound agent defaults changed")
       sink = new("sink", this);
+      sampled = new("sampled", this);
+      sampler = new("sampler");
     endfunction
 
     // 订阅真实 TX 引脚采样；不依赖 command 返回值判断报文是否真正发送。
@@ -40,14 +44,35 @@ package eth_net_packet_aip_test_pkg;
 
     // test 在 end_of_elaboration 后调用，复制一批明确的期望原始字节。
     function void expect_batch(input packet p, input int count);
-      repeat (count) sink.expect_bytes(p.raw_data, 0, 0, ETH_SEG_TX);
+      repeat (count) begin
+        sink.expect_bytes(p.raw_data, 0, 0, ETH_SEG_TX);
+        sampled.expect_bytes(p.raw_data, 0, 0, ETH_SEG_TX);
+      end
       expected_count += count;
     endfunction
+
+    // 命令对象尚未创建时就注册持久订阅，多次 Tcl 命令复用同一个缓存消费者。
+    function void end_of_elaboration_phase(uvm_phase phase);
+      super.end_of_elaboration_phase(phase);
+      sampler.set_sequencer(eth_seg_sequencer::get_sqr(agt.get_full_name()));
+      sampler.subscribe(ETH_SEG_TX);
+    endfunction
+
+    // 持续取包并与独立期望比较；UVM phase 结束时结束等待，缓存已由 complete 核对。
+    task run_phase(uvm_phase phase);
+      forever begin
+        eth_seg_seq_item item;
+        sampler.mon_xaction(item, ETH_SEG_TX);
+        if (item == null) break;
+        sampled.write(item);
+      end
+    endtask
 
     // 队列、数量、驱动及监视器均完成才允许结束；多包也不能视为 complete。
     function bit complete();
       return sink.expected.size() == 0 && sink.received == expected_count &&
-             agt.tx_driver.is_idle() && agt.tx_monitor.is_idle();
+             sampled.expected.size() == 0 && sampled.received == expected_count &&
+             agt.monitor_hub.is_idle() && agt.tx_driver.is_idle() && agt.tx_monitor.is_idle();
     endfunction
   endclass
 

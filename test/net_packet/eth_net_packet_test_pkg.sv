@@ -24,6 +24,36 @@ package eth_net_packet_test_pkg;
     endtask
   endclass
 
+  // 逐包生成的业务子类：继承唯一 count/body，只覆写协议字段并 repack。
+  class eth_net_index_seq extends eth_base_seq;
+    // 创建身份，不额外声明 count，防止 Tcl 设置到父类而循环读取子类变量。
+    function new(string name = "indexed");
+      super.new(name);
+    endfunction
+
+    // 目的 MAC 编入 packet_index，接收端以独立构造的头检查每包确实重新生成。
+    virtual function packet create_packet(int unsigned packet_index);
+      packet p = super.create_packet(packet_index);
+      eth_header header = p.get_eth();
+      header.dst_mac = 48'h123456780000 + packet_index;
+      p.do_pack();
+      return p;
+    endfunction
+  endclass
+
+  // 明确返回空报文的测试生成器，验证默认 body 在错误路径不会发包或通知成功。
+  class eth_net_null_seq extends eth_base_seq;
+    // 只保存 UVM 身份。
+    function new(string name = "null_generator");
+      super.new(name);
+    endfunction
+
+    // 受控失败，用于精确匹配 ETH_NET_NULL。
+    virtual function packet create_packet(int unsigned packet_index);
+      return null;
+    endfunction
+  endclass
+
   // 单个接收器独立持有期望快照，可同时检查字节、EOP、FCS 和无错误边带。
   class eth_net_sink extends uvm_subscriber#(eth_seg_seq_item);
     eth_seg_seq_item expected[$];
@@ -108,7 +138,8 @@ package eth_net_packet_test_pkg;
     bit done = 0;
     eth_seg_agent#(RATE) client, mac;
     eth_seg_config#(RATE) client_cfg, mac_cfg;
-    eth_net_sink tx_sink, rx_sink;
+    eth_net_sink tx_sink, rx_sink, sampled_tx, sampled_rx;
+    eth_base_seq tx_sampler, rx_sampler;
 
     // case 名字与 HDL 侧 vif 的路径一一对应。
     function new(string name, uvm_component parent);
@@ -146,6 +177,10 @@ package eth_net_packet_test_pkg;
       mac.cfg = mac_cfg;
       tx_sink = new("tx_sink", this);
       rx_sink = new("rx_sink", this);
+      sampled_tx = new("sampled_tx", this);
+      sampled_rx = new("sampled_rx", this);
+      tx_sampler = new("tx_sampler");
+      rx_sampler = new("rx_sampler");
     endfunction
 
     // 订阅对端 monitor，确保比较的是公共引脚采样而非 driver 的完成通知。
@@ -216,34 +251,123 @@ package eth_net_packet_test_pkg;
           `uvm_fatal("ETH_NET_ICRC", "source RoCEv2 ICRC is invalid")
         sink.expect_bytes(expected_bytes, client_cfg.preamble_passthrough,
                           client_cfg.include_fcs, is_rx ? ETH_SEG_RX : ETH_SEG_TX);
+        if (is_rx) sampled_rx.expect_bytes(expected_bytes, client_cfg.preamble_passthrough,
+                                          client_cfg.include_fcs, ETH_SEG_RX);
+        else sampled_tx.expect_bytes(expected_bytes, client_cfg.preamble_passthrough,
+                                     client_cfg.include_fcs, ETH_SEG_TX);
         if (i == 0) single.pkt = p;
         else batch.packets.push_back(p);
       end
       single.start(sqr_handle);
       batch.start(sqr_handle);
+      send_count_batches(is_rx);
     endtask
 
-    // 等全部引脚报文被消费且驱动/监视器空闲；有上限，漏包不能静默结束。
+    // 每方向原有 8 包加三组 count=3；400G 默认格式另加32短包覆盖同拍包边界。
+    function int frame_total();
+      return 17 + ((RATE == 400 && format_mode == 0) ? 32 : 0);
+    endfunction
+
+    // 一份独立期望同时交给 analysis 与 seq 消费者，两个 sink 各自复制。
+    function void expect_generated(packet p, bit is_rx);
+      eth_net_sink sink = is_rx ? rx_sink : tx_sink;
+      eth_net_sink sampled = is_rx ? sampled_rx : sampled_tx;
+      eth_seg_dir_e dir = is_rx ? ETH_SEG_RX : ETH_SEG_TX;
+      sink.expect_bytes(p.raw_data, format_mode[1], format_mode[0], dir);
+      sampled.expect_bytes(p.raw_data, format_mode[1], format_mode[0], dir);
+    endfunction
+
+    // 独立生成默认协议参考字节，不调用被测 create_packet/packet_to_item。
+    function packet count_reference(bit indexed, int index = 0);
+      packet p = new();
+      eth_header header;
+      p.build_from_template(ETH_IPV4_UDP);
+      p.pkt_len = 256;
+      p.payload_mode = PAYLOAD_FIXED;
+      p.payload_fixed_val = 8'ha5;
+      header = p.get_eth();
+      if (indexed) header.dst_mac = 48'h123456780000 + index;
+      p.do_pack();
+      return p;
+    endfunction
+
+    // 验证显式字节重放、默认新建和派生生成；调用方的 pkt 在自动生成后仍须为空。
+    task send_count_batches(bit is_rx);
+      eth_seg_sequencer sqr_handle = is_rx ? mac.sequencer : client.sequencer;
+      eth_base_seq replay = new("replay");
+      eth_base_seq generated = new("generated");
+      eth_net_index_seq indexed = new("indexed");
+      packet p = count_reference(0);
+      p.raw_data[52] ^= 8'h80;
+      replay.pkt = p;
+      replay.count = 3;
+      repeat (3) expect_generated(p, is_rx);
+      replay.start(sqr_handle);
+      generated.count = 3;
+      repeat (3) expect_generated(count_reference(0), is_rx);
+      generated.start(sqr_handle);
+      indexed.count = 3;
+      for (int n = 0; n < 3; n++) expect_generated(count_reference(1, n), is_rx);
+      indexed.start(sqr_handle);
+      if (generated.pkt != null || indexed.pkt != null)
+        `uvm_fatal("ETH_NET_GENERATOR", "generated packet overwrote caller input")
+      if (RATE == 400 && format_mode == 0) begin
+        eth_base_seq short_batch = new("short_batch");
+        packet short_packet = make_packet(6, is_rx ? 1000 : 0);
+        short_batch.pkt = short_packet;
+        short_batch.count = 32;
+        repeat (32) expect_generated(short_packet, is_rx);
+        short_batch.start(sqr_handle);
+      end
+    endtask
+
+    // 使用 set_sequencer 的长期对象取整包，绝不 start 采样对象的发送 body。
+    task sample_stream(bit is_rx);
+      eth_seg_seq_item item;
+      repeat (frame_total()) begin
+        if (is_rx) rx_sampler.mon_xaction(item, ETH_SEG_RX, 0, 10us);
+        else tx_sampler.mon_xaction(item, ETH_SEG_TX, 0, 10us);
+        if (item == null) `uvm_fatal("ETH_NET_SAMPLE", "complete packet missing")
+        if (is_rx) sampled_rx.write(item);
+        else sampled_tx.write(item);
+      end
+    endtask
+
+    // 排空必须同时满足整包数量、四个独立期望队列与真实驱动/监视器空闲。
+    function bit complete();
+      return tx_sink.received == frame_total() && rx_sink.received == frame_total() &&
+             sampled_tx.received == frame_total() && sampled_rx.received == frame_total() &&
+             tx_sink.expected.size() == 0 && rx_sink.expected.size() == 0 &&
+             sampled_tx.expected.size() == 0 && sampled_rx.expected.size() == 0 &&
+             client.tx_driver.is_idle() && mac.rx_driver.is_idle() &&
+             mac.tx_monitor.is_idle() && client.rx_monitor.is_idle();
+    endfunction
+
+    // 流量启动前注册，四个线程并行覆盖 analysis 和公共 seq 获取同一批完整报文。
     task run_phase(uvm_phase phase);
       wait (client_cfg.vif.i_tx_rst_n && client_cfg.vif.i_rx_rst_n);
+      tx_sampler.set_sequencer(client.sequencer);
+      rx_sampler.set_sequencer(mac.sequencer);
+      tx_sampler.subscribe(ETH_SEG_TX);
+      rx_sampler.subscribe(ETH_SEG_RX);
       fork
         send_stream(0);
         send_stream(1);
+        sample_stream(0);
+        sample_stream(1);
       join
-      for (int cycles = 0; cycles < 5000; cycles++) begin
-        if (tx_sink.received == 8 && rx_sink.received == 8 && client.tx_driver.is_idle() &&
-            mac.rx_driver.is_idle() && mac.tx_monitor.is_idle() && client.rx_monitor.is_idle()) break;
+      for (int cycles = 0; cycles < 5000 && !complete(); cycles++)
         @(negedge client_cfg.vif.i_clk_tx);
-      end
       repeat (5) @(negedge client_cfg.vif.i_clk_tx);
-      if (tx_sink.received != 8 || rx_sink.received != 8 || tx_sink.expected.size() || rx_sink.expected.size() ||
-          !client.tx_driver.is_idle() || !mac.rx_driver.is_idle() ||
-          !mac.tx_monitor.is_idle() || !client.rx_monitor.is_idle())
-        `uvm_fatal("ETH_NET_TIMEOUT", $sformatf("TX/RX received=%0d/%0d pending expectations=%0d/%0d driver_idle=%0b/%0b monitor_idle=%0b/%0b",
-                   tx_sink.received, rx_sink.received, tx_sink.expected.size(), rx_sink.expected.size(),
-                   client.tx_driver.is_idle(), mac.rx_driver.is_idle(),
-                   mac.tx_monitor.is_idle(), client.rx_monitor.is_idle()))
-      `uvm_info("ETH_NET_RATE_PASS", $sformatf("RATE=%0d preamble=%0b fcs=%0b: 8 TX + 8 RX matched", RATE, format_mode[1], format_mode[0]), UVM_NONE)
+      if (!complete()) `uvm_fatal("ETH_NET_TIMEOUT", "physical or sampled packet count/drain failed")
+      if (RATE == 400 && format_mode == 0 &&
+          (mac.tx_monitor.same_cycle_boundaries == 0 || client.rx_monitor.same_cycle_boundaries == 0))
+        `uvm_fatal("ETH_NET_BOUNDARY", "full-load short frames never shared a cycle")
+      if (!client.monitor_hub.is_idle() || !mac.monitor_hub.is_idle())
+        `uvm_fatal("ETH_NET_DRAIN", "sampling queue retained complete packets")
+      tx_sampler.unsubscribe(ETH_SEG_TX);
+      rx_sampler.unsubscribe(ETH_SEG_RX);
+      `uvm_info("ETH_NET_RATE_PASS", $sformatf("RATE=%0d preamble=%0b fcs=%0b: %0d TX + %0d RX matched via analysis and seq", RATE, format_mode[1], format_mode[0], frame_total(), frame_total()), UVM_NONE)
       done = 1;
     endtask
   endclass
@@ -254,6 +378,8 @@ package eth_net_packet_test_pkg;
     eth_net_rate_case#(100) case100[4];
     eth_net_rate_case#(200) case200[4];
     eth_net_rate_case#(400) case400[4];
+    eth_seg_sequencer sample_only;
+    uvm_sequencer#(eth_seg_seq_item) wrong_type;
 
     // test 由 run_test 创建；子 case 在 build 中创建。
     function new(string name = "eth_net_packet_test", uvm_component parent = null);
@@ -263,6 +389,8 @@ package eth_net_packet_test_pkg;
     // 每种速率覆盖无格式、仅 FCS、仅前导、前导加 FCS 四种静态配置。
     function void build_phase(uvm_phase phase);
       super.build_phase(phase);
+      sample_only = new("sample_only", this);
+      wrong_type = new("wrong_type", this);
       for (int i = 0; i < 4; i++) begin
         case100[i] = new($sformatf("r100_m%0d", i), this);
         case200[i] = new($sformatf("r200_m%0d", i), this);
@@ -330,12 +458,42 @@ package eth_net_packet_test_pkg;
       `uvm_info("ETH_NET_CONVERSION_PASS", "byte snapshots, deep copies and six negative boundaries passed", UVM_NONE)
     endtask
 
+    // 新 API 的失败路径不应进入 UVM item 仲裁；测试专用 sqr 没有 driver，卡住会超时。
+    task check_sequence_contract();
+      eth_base_seq seq = new("invalid_sequence");
+      eth_net_null_seq null_seq = new("null_sequence");
+      eth_net_expected_fatal catcher = new();
+      eth_seg_seq_item item;
+      uvm_report_cb::add(null, catcher);
+      catcher.expected_id = "ETH_NET_COUNT";
+      seq.count = 0;
+      seq.start(case100[0].client.sequencer);
+      seq.count = -1;
+      seq.start(case100[0].client.sequencer);
+      seq.count = 1;
+      catcher.expected_id = "ETH_NET_SQR";
+      seq.start(wrong_type);
+      seq.set_sequencer(null);
+      seq.mon_xaction(item, ETH_SEG_RX);
+      catcher.expected_id = "ETH_NET_PASSIVE";
+      seq.start(sample_only);
+      catcher.expected_id = "ETH_SAMPLE_HUB";
+      seq.subscribe(ETH_SEG_RX);
+      catcher.expected_id = "ETH_NET_NULL";
+      null_seq.start(case100[0].client.sequencer);
+      uvm_report_cb::delete(null, catcher);
+      if (catcher.caught != 7)
+        `uvm_fatal("ETH_NET_NEGATIVE", "expected seven sequence boundary diagnostics")
+      `uvm_info("ETH_NET_SEQUENCE_PASS", "seven count/type/passive/generator boundaries passed", UVM_NONE)
+    endtask
+
     // 同时等待十二个 link，计数/格式错误仍由 UVM summary 决定最终成败。
     task run_phase(uvm_phase phase);
       phase.raise_objection(this);
       check_conversion_contract();
+      check_sequence_contract();
       foreach (case100[i]) wait (case100[i].done && case200[i].done && case400[i].done);
-      `uvm_info("ETH_NET_TEST_COMPLETE", "12 links, 192 physical frames and conversion contract passed", UVM_NONE)
+      `uvm_info("ETH_NET_TEST_COMPLETE", "12 links, 472 physical frames, whole-packet sampling and batch conversion passed", UVM_NONE)
       phase.drop_objection(this);
     endtask
   endclass

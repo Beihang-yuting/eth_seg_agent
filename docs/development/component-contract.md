@@ -12,13 +12,14 @@
 - `eth_seg_seq_item`：`rand byte unsigned frame_bytes[]`；`bit fcs_present=0,inject_fcs_error=0,inject_error=0,rx_fcs_error=0`；`bit[1:0] rx_error=0`、`bit[2:0]rx_status=1`；`int start_segment=-1,eop_segment=-1,empty_bytes=0,gap_segments=0`；`eth_seg_dir_e direction`；`bit fcs_checked=0,fcs_ok=0,aborted=0`；`bit[31:0] fcs`；`time start_time,end_time`。实现深拷贝。
 - `eth_seg_codec` 非参数化静态类；`static function bit[31:0] crc32(input byte unsigned data[])`；`static function void encode(input eth_seg_seq_item item,input bit preamble,input bit include_fcs,output eth_seg_byte_queue_t bytes)`；`static function bit decode(input eth_seg_byte_queue_t bytes,input bit preamble,input bit include_fcs,ref eth_seg_seq_item item,output string reason)`。
 - encode：include_fcs且fcs_present=0时自动追加CRC；fcs_present=1则frame_bytes已经含尾4B；inject_fcs_error只在include_fcs时翻转尾CRC一位；preamble为55*7+D5。decode移除前导，frame_bytes保留FCS（如果含有），填fcs_checked/ok和值。CRC不匹配是合法错误报文，只设置fcs_ok=0；格式不合法才返回0。
-- `eth_seg_sequencer extends uvm_sequencer#(eth_seg_seq_item)` 非参数化。
+- `eth_seg_sequencer extends uvm_sequencer#(eth_seg_seq_item)` 非参数化；active/passive 都创建并按完整 agent 名称登记。`monitor_hub` 在 build 关联，`can_send` 在 connect 发布；passive 只提供采样。
+- `eth_seg_monitor_hub` 接收 Monitor 的 EOP 整包，为每个 `(direction, portid)` 保存独立深拷贝；提供 `subscribe/mon_xaction/unsubscribe`，默认容量 1024 包，溢出 fatal，不回放订阅前数据。
 - `eth_seg_tx_driver#(RATE)` / `eth_seg_rx_driver#(RATE)` extends uvm_driver#(eth_seg_seq_item)，`cfg` 由agent预设，`sent_ap` 在EOP拍真正采样后发布；`packets_sent` 计数；`is_idle()`。
 - `eth_seg_ready_driver#(RATE)` extends uvm_component，只驱动 ready，cfg由agent设置。
 - `eth_seg_tx_monitor#(RATE)` / RX：cfg预设，`item_collected_port`，`packets_seen`、`aborted_packets`、`valid_cycles`、`invalid_cycles`、`idle_segments`、`data_segments`、`bytes_seen`、`same_cycle_boundaries` 计数，`is_idle()`；错误通过uvm_error，预期CRC错误只记录fcs_ok。
 - `eth_seg_agent#(RATE)` cfg由父设置或config_db取得；tx_monitor/rx_monitor始终创建；active按role建立tx_driver或rx_driver+ready_driver；成员 `sequencer` 非参数化。
 - `eth_seg_env#(RATE)` 的 `client_cfg,mac_cfg` 在父build前赋值；创建client_agent/mac_agent；scoreboard关联 active driver.sent_ap 与一组monitor，coverage只订阅一组monitor。支持 `enable_scoreboard=1`、`enable_coverage=1`。
-- `eth_seg_scoreboard` 非参数化，两方向独立 FIFO：`expect_tx/expect_rx/actual_tx/actual_rx` 为 analysis_imp；`matched_tx/matched_rx`；`is_idle()`；对比frame_bytes、inject_error(TX)、RX三类边带、FCS存在性。
+- `eth_seg_scoreboard` 非参数化，两方向独立 FIFO：`expect_tx/expect_rx/actual_tx/actual_rx` 为 analysis_imp；`matched_tx/matched_rx`；`is_idle()`；对比frame_bytes、inject_error(TX)、RX三类边带、FCS存在性。`write_before/write_after` 分别写 TX expected/actual，`flush_direction` 只清指定方向队列，保留累计计数。
 - `eth_seg_coverage#(RATE)` 接收 `write(eth_seg_seq_item item)`；按事务字段覆盖位置/empty/方向/格式/错误；时序coverage可直接采样vif，配置 `cfg`。
 - checker独立module参数RATE，端口显式信号（不用bind-to-interface），输入tx/rx clock/reset及完整TX/RX引脚；`enable_tx=1,enable_rx=1`。reset后历史清0，expected valid=ready_history[1]；上一拍值用于当前valid0保持检查。
 
@@ -46,3 +47,17 @@
   TX valid=0 时全部输出保持的原规则不变。
 
 定向覆盖与审查记录见 [时序审查](timing-audit.md)。
+
+## 整包采样与批量发送约定
+
+- `eth_base_seq` 位于可选 `eth_net_packet_pkg`，直接提供三种采样方法，不另加父类。
+  `count=1` 是唯一默认批量循环；显式 pkt 重放原字节，空 pkt 每轮调用 create_packet。
+- `mon_xaction` 成功返回一个完整 EOP 事务；默认从目的 MAC 到 payload，保留线上
+  padding。前导移除，启用 FCS 时尾四字节保留，RM 不需要重新拼接 segment。
+- hub 复位清理仅限该方向缓存，保留订阅和等待者，原 timeout 截止时间不变。
+  `reset_ap` 按值发布 direction/asserted/epoch；已交给 RM 的包由用户协调终止预测。
+- RM/SCB 示例采用任一方向复位就丢弃整条链路在途包的策略，独立于 hub 的方向清理。
+  测试结束同时核对数量和各层排空，sequence 返回不代表物理传输结束。
+
+完整接口见 [采样集成说明](../integration/sampling.md)，验证证据见
+[采样验证记录](sampling-validation.md)。

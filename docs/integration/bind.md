@@ -101,7 +101,8 @@ checker 默认打开；`cfg.enable_protocol_check` 由各时钟负沿采样，�
 
 ## 3. 静态 sqr 与 Tcl 发包
 
-每个 active agent 在 connect 自动登记，final 时撤销；PASSIVE 不登记。
+每个 active/passive agent 在 connect 自动登记，final 时撤销。PASSIVE 提供整包采样入口，
+其 can_send=0，公共发包 sequence 和 Tcl 入口会拒绝发送；driver 仍只由 active 创建。
 静态表定义在非参数化 `eth_seg_sequencer` 中，三种速率共用一张按名字索引的表：
 
 ```systemverilog
@@ -113,6 +114,7 @@ eth_seg_sequencer::sqr["eth3"]
 
 推荐查询接口 `eth_seg_sequencer::get_sqr("eth0")`：名字不存在时返回 null，不插入表项。
 表只保存借用句柄，不创建或共享实际 sequencer；四个 IP 有四个独立仲裁器。
+通过同一静态句柄取得整包以及接入 RM/SCB，参见 [整包采样说明](sampling.md)。
 如果 agent 由普通 env 创建，索引使用完整名字，例如 `uvm_test_top.env.client`。
 
 基于 `aip_core/update` 的可选示例在 `examples/aip/eth_seg_aip_pkg.sv`：
@@ -171,5 +173,8 @@ bind 用例覆盖四个 IP（三种速率）、同速率多实例静态 sqr 隔�
 分别接收 3/3/1/4 帧，并逐字节核对长度、数据与端口隔离。两者都是接口自检壳，不含
 厂商 MAC RTL。日志分别在 `build/bind/logs`、`build/aip/logs`，实际验证记录见 `results/bind_static`。
 
-2026-10-30 已在 53 的 VCS W-2024.09-SP1 / UVM 1.2 上通过：bind seed 7/19、
+原 bind 简化版本于 2026-10-30 在 53 的 VCS W-2024.09-SP1 / UVM 1.2 上通过：bind seed 7/19、
 smoke seed 7、AIP Tcl seed 7；最终 UVM WARNING/ERROR/FATAL 和 VCS 原生诊断均为 0。
+
+整包采样扩展增加 passive sequencer 的直接取包检查，最新验证见
+[采样验证记录](../development/sampling-validation.md)。

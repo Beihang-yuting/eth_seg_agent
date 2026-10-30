@@ -77,33 +77,49 @@ test 需要继续持有 objection，等 monitor/scoreboard 收完期望报文后
 顶层 `#0; run_test();` 只协调 bind 的 cfg/agent 初始化；Tcl/sequence 要在
 UVM connect 后启动，详见 [bind 集成说明](bind.md)。
 
-## 派生业务 sequence
+## 批量发送
 
-业务层负责决定报文内容，调用基类的 `send_packet()` 即可复用转换和 UVM 握手。
+`count` 由 eth_base_seq 统一定义，默认 1，必须大于零：
 
 ```systemverilog
-// 用户 sequence package：依赖上述三个 package 和 uvm_macros.svh。
-// 本 sequence 拥有循环内的 packet；driver 在入队时保存独立事务副本。
+seq.pkt = pkt;  // 显式 pkt：重放相同 raw_data 字节快照。
+seq.count = 100;
+seq.start(sqr);
+```
+
+不设置 pkt 时，每轮调用 create_packet() 新建独立报文；默认 256B IPv4/UDP、
+payload=0xa5。子类可覆写 create_packet，基类负责 count 循环。不要在子类重复
+声明 count，也不要在覆写的 create_packet 中再循环 count 次。
+
+## 派生业务 sequence
+
+业务层只决定每包内容，继承默认批量循环：
+
+```systemverilog
+// 用户 sequence package：依赖 net_packet_pkg、eth_seg_pkg、eth_net_packet_pkg。
 class my_udp_seq extends eth_base_seq;
   `uvm_object_utils(my_udp_seq)
-  int count = 10;
 
-  // 初始化 UVM 身份，不提前生成报文。
+  // count 是继承的字段，仍可由 Tcl 宏直接设置。
   function new(string name = "my_udp_seq");
     super.new(name);
+    count = 10;
   endfunction
 
-  // 每次随机化已触发 packet.post_randomize 打包；发送时保持该字节快照。
-  virtual task body();
-    for (int i = 0; i < count; i++) begin
-      packet p = new();
-      if (!p.randomize() with { pkt_kind == ETH_IPV4_UDP; pkt_len == 256; })
-        `uvm_fatal("PACKET_RANDOM", "network packet randomization failed")
-      send_packet(p);
+  // 每次随机化触发 post_randomize 打包；转换保持该字节快照。
+  virtual function packet create_packet(int unsigned packet_index);
+    packet p = new();
+    if (!p.randomize() with { pkt_kind == ETH_IPV4_UDP; pkt_len == 256; }) begin
+      `uvm_fatal("PACKET_RANDOM", "network packet randomization failed")
+      return null;
     end
-  endtask
+    return p;
+  endfunction
 endclass
 ```
+
+复杂业务也可覆写 body 并调用 send_packet；此时发送循环由该 body 自己负责。
+采样方法可以直接在本类对象上使用，详见 [整包采样及 RM/SCB](sampling.md)。
 
 需要逐包调整 EOP 错误边带时，可在派生 `body()` 中使用
 `eth_seg_seq_item item = packet_to_item(p)`，设置 `item.inject_error`、
@@ -131,7 +147,8 @@ sequence 中使用。
 转换器无法判断非空 `raw_data` 是否对应最新字段。再次 `do_pack()` 也可能重新生成
 随机 payload，因此已有定制字节或错误注入时直接使用当前 `raw_data`。
 
-空句柄、没有字节也没有协议栈、自动打包路径中的空协议层/非 Ethernet 起始层、
+传给 packet_to_item/send_packet 的空句柄、没有字节也没有协议栈、
+自动打包路径中的空协议层/非 Ethernet 起始层、
 小于 14B 的结果都会产生明确 UVM fatal。更短的底层异常刺激可继续直接创建
 `eth_seg_seq_item`。自动打包可能加入 RoCEv2 对齐字节，实际长度应看 `raw_data.size()`。
 手动导入的字节也须满足不含前导/Ethernet FCS 的输入约定；转换器不猜测并删除尾字节。
@@ -139,7 +156,8 @@ sequence 中使用。
 ## AIP Tcl 发包
 
 `examples/aip/eth_net_packet_aip_pkg.sv` 中的 `eth_net_packet_aip_seq` 继承
-`eth_base_seq`，只负责生成报文；`count` 由 `aip_cmd_seq` 设置。每帧按当前
+`eth_base_seq`，只覆写 create_packet/packet_queued；继承的 `count` 由
+`aip_cmd_seq` 设置，批量循环只有基类一份。每帧按当前
 sequencer 的父 agent 全名读取参数，默认 256B IPv4/UDP，payload 为 `8'ha5`。
 
 四个示例命令映射到 `eth0`～`eth3`；用户按自己的 `AGENT_NAME` 修改宏即可：
@@ -166,6 +184,10 @@ eth0_net_send count=10
 使用 `aip_int`。参数仅影响此例生成的新报文，不会修改 agent cfg。示例校验长度
 在 14～16384B 且容纳得下协议栈；公共转换 sequence 本身不施加这个示例上限。
 顶层 env 无需重复创建 bind agent 或转接 sequencer。
+每个命令创建新的发送 sequence，Monitor 订阅缓存在 agent 内持续存在。
+没有 load_send_config；参数在每包生成时直接读取，之后的修改不影响已经入队的副本。
+当前 aip_cmd_seq 自动解析 count/time；其它报文参数使用上面的 set_param，
+没有自动支持 `eth0_net_send count=10 pkt_len=256` 这样的任意字段映射。
 
 ## 验证入口
 
@@ -176,10 +198,11 @@ make net-packet-test NET_PACKET=/path/to/net_packet SEED=7
 make net-packet-aip-test NET_PACKET=/path/to/net_packet AIP_CORE=/path/to/aip_core SEED=7
 ```
 
-普通测试覆盖三速率 × 四种前导/FCS 组合，每条 link 发送 8 TX + 8 RX，逐字节比较
+普通测试覆盖三速率 × 四种前导/FCS 组合，每条 link 至少发送 17 TX + 17 RX，
+400G 默认格式另加每方向32短包，共472个物理帧；analysis 与 seq 两条路径逐字节比较
 IPv4/UDP、IPv6/TCP、ARP、VLAN、VXLAN、RoCEv2、短帧和随机 payload；同时检查连续、
 周期、随机 ready/valid 及随机负载。转换边界测试覆盖随机化后已打包输入、字节错误保留、
-深拷贝以及六次精确匹配的预期 fatal。
+深拷贝以及六次精确匹配的转换 fatal；另验证七次 count/type/passive/生成器边界。
 
 AIP 测试通过真实 UCLI/Tcl 启动四个命名 bind agent，检查多种协议、48-bit MAC 参数、
 同端口运行时改参和同速率不同实例隔离。所有用例都等待 monitor 完成，不以命令返回

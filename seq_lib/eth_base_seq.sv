@@ -2,16 +2,70 @@
 // 和 eth_seg_pkg；不包含 net_packet 单文件，避免同名 packet 出现在不同 package。
 // pkt 是调用方借出的报文；已打包内容只读，首次自动打包会更新该报文的 raw_data/校验字段。
 // 每次转换都创建独立事务及字节数组，driver 仍按现有约定再深拷贝入队。
+// 采样方法借用 agent 的永久 hub；RM/SCB 用独立对象 set_sequencer，不启动发送 body。
 class eth_base_seq extends uvm_sequence#(eth_seg_seq_item);
   `uvm_object_utils(eth_base_seq)
 
-  // 直接 start 时发送这一帧；批量/协议流程通过派生 body 调用 send_packet。
-  // 本类不拥有协议头，也不在发送后清空 pkt，调用者可显式重复发送同一份字节快照。
+  // 非空 pkt 按原字节重放 count 次；为空则每轮 create_packet 构造新的报文。
+  // 显式 pkt 属于调用方；生成路径只用局部对象，不能覆盖此输入而误切换为重放。
   net_packet_pkg::packet pkt;
+  int count = 1;
+  protected bit last_send_ok;
 
-  // 初始化 UVM sequence 身份；不隐式创建或随机化网络报文，漏传 pkt 应明确失败。
+  // 初始化 UVM 身份；构造不发送，默认报文仅在 body 的逐包生成阶段建立。
   function new(string name = "eth_base_seq");
     super.new(name);
+  endfunction
+
+  // 统一校验 sqr 类型和发送能力；采样允许 passive，发送拒绝无 driver 的仲裁器。
+  protected function eth_seg_sequencer require_sqr(bit sending = 0);
+    eth_seg_sequencer handle;
+    if (!$cast(handle, get_sequencer()) || handle == null) begin
+      `uvm_fatal("ETH_NET_SQR", "an Ethernet sequencer must be associated before use")
+      return null;
+    end
+    if (sending && !handle.can_send) begin
+      `uvm_fatal("ETH_NET_PASSIVE", "this Ethernet sequencer has no sending driver")
+      return null;
+    end
+    return handle;
+  endfunction
+
+  // 注册整包消费者；portid 按当前 agent/方向区分，与 IP 编号无关。
+  function void subscribe(eth_seg_dir_e dir, int unsigned portid = 0, int unsigned depth = 1024);
+    eth_seg_sequencer handle = require_sqr();
+    if (handle != null) handle.subscribe(dir, portid, depth);
+  endfunction
+
+  // 一次取一个完整 Ethernet 帧，组包由 Monitor 完成；timeout=0 无限等待。
+  // 超时/取消返回 null，复位清缓存但继续等待；调用者必须检查返回句柄。
+  task mon_xaction(output eth_seg_seq_item tr, input eth_seg_dir_e dir,
+                   input int unsigned portid = 0, input time timeout = 0);
+    eth_seg_sequencer handle = require_sqr();
+    tr = null;
+    if (handle != null) handle.mon_xaction(tr, dir, portid, timeout);
+  endtask
+
+  // 撤销订阅并唤醒等待者；发送命令结束不会自动取消其它对象使用的持久订阅。
+  function void unsubscribe(eth_seg_dir_e dir, int unsigned portid = 0);
+    eth_seg_sequencer handle = require_sqr();
+    if (handle != null) handle.unsubscribe(dir, portid);
+  endfunction
+
+  // 无显式 pkt 时每包新建默认 256B IPv4/UDP；业务/AIP 子类覆写此函数读取参数。
+  // 本函数不修改输入 pkt；修改协议头后应重新 do_pack，返回的字节才会反映新字段。
+  virtual function net_packet_pkg::packet create_packet(int unsigned packet_index);
+    net_packet_pkg::packet generated = new();
+    generated.build_from_template(net_packet_pkg::ETH_IPV4_UDP);
+    generated.pkt_len = 256;
+    generated.payload_mode = net_packet_pkg::PAYLOAD_FIXED;
+    generated.payload_fixed_val = 8'ha5;
+    generated.do_pack();
+    return generated;
+  endfunction
+
+  // 每包成功入队后的可选通知；基础 VIP 无外部活动计数依赖，也不表示物理完成。
+  virtual function void packet_queued(int unsigned packet_index);
   endfunction
 
   // 返回新事务，逐字节保持网络顺序：raw_data[0] 对应目的 MAC 第一个字节。
@@ -65,18 +119,33 @@ class eth_base_seq extends uvm_sequence#(eth_seg_seq_item);
   virtual task send_packet(input net_packet_pkg::packet net_pkt);
     eth_seg_seq_item item;
 
-    if (get_sequencer() == null) begin
-      `uvm_fatal("ETH_NET_SQR", "start eth_base_seq on an active Ethernet sequencer before sending")
-      return;
-    end
+    last_send_ok = 0;
+    if (require_sqr(1) == null) return;
     item = packet_to_item(net_pkt);
     if (item == null) return;
     start_item(item);
     finish_item(item);
+    last_send_ok = 1;
   endtask
 
-  // 默认单包路径；业务子类可覆写 body 并反复调用 send_packet，转换逻辑只有一份。
+  // 唯一的 count 循环；生成器或转换失败时停止，不触发成功通知。调用者持有 objection
+  // 直到 Monitor/RM/SCB 排空；Tcl 命令返回不等于线上 count 个包已经全部结束。
   virtual task body();
-    send_packet(pkt);
+    if (require_sqr(1) == null) return;
+    if (count <= 0) begin
+      `uvm_fatal("ETH_NET_COUNT", "count must be positive")
+      return;
+    end
+    for (int n = 0; n < count; n++) begin
+      net_packet_pkg::packet current_packet;
+      current_packet = (pkt != null) ? pkt : create_packet(n);
+      if (current_packet == null) begin
+        `uvm_fatal("ETH_NET_NULL", "packet generator returned null")
+        return;
+      end
+      send_packet(current_packet);
+      if (!last_send_ok) return;
+      packet_queued(n);
+    end
   endtask
 endclass

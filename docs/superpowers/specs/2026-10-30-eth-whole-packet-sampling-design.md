@@ -2,7 +2,8 @@
 
 日期：2026-10-30。代码基线：`26abff6`。
 
-状态：用户已确认本文设计；进入实施计划阶段，尚未实施。
+状态：已按用户确认的设计完成实现，53 上定向验证及回归通过。具体快照、
+测试计数和适用范围见 [采样验证记录](../../development/sampling-validation.md)。
 
 ## 1. 使用目标与约束
 
@@ -61,7 +62,7 @@ hub 持有按 `(direction, portid)` 索引的订阅队列。
 sequencer 持有 hub 的借用句柄并转发公共接口，不引用 `eth_seg_agent#(RATE)`。
 `eth_base_seq` 检查 sequencer 类型后委托给该 sequencer。
 
-拟定公共接口如下，声明中的缺省值即使用契约：
+公共接口如下，声明中的缺省值即使用契约：
 
 ```systemverilog
 function void subscribe(
@@ -236,4 +237,4 @@ Monitor 的复位通知；扩展 eth_base_seq 和 SCB；精简可选 AIP 子类�
 
 负向测试按精确报告 ID 和次数判定，其余测试要求零意外 UVM_ERROR/FATAL，
 均须有明确完成标志和超时。完成后记录命令、依赖版本、日志及测试统计。
-本设计只完成文档阶段时，不声明上述代码已实现或仿真已通过。
+实现及实际验证证据以配套验证记录为准；这些测试不包含用户 DUT 或厂商 F-Tile RTL。

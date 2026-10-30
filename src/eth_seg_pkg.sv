@@ -8,6 +8,7 @@ package eth_seg_pkg;
   `include "eth_seg_seq_item.sv"
   `include "eth_seg_codec.sv"
   `include "eth_seg_config.sv"
+  `include "eth_seg_monitor_hub.sv"
   `include "eth_seg_sequencer.sv"
   `include "eth_seg_tx_driver.sv"
   `include "eth_seg_rx_driver.sv"

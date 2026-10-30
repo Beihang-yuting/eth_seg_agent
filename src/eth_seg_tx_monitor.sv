@@ -1,6 +1,7 @@
 // src 观察层：TX segmented client 引脚监视器。
 // 本组件只读 eth_seg_if 的公共 TX 网络，逐个有效 segment 重建字节队列；
 // 它拥有当前包的临时状态和发布事务，不驱动 interface，也不与 driver 共享可变对象。
+// reset_state_port 只发布本方向采样到的复位变化，hub/test 决定缓存和预测清理策略。
 // skip_crc 由引脚逐段采样并作为当前包的 FCS 格式依据；CRC 错误属于合法报文，
 // 仅记录 fcs_ok=0，格式损坏才报告 UVM_ERROR。复位期间未结束的包被标记 aborted 丢弃。
 class eth_seg_tx_monitor #(int RATE = 100) extends uvm_component;
@@ -9,6 +10,8 @@ class eth_seg_tx_monitor #(int RATE = 100) extends uvm_component;
   eth_seg_config#(RATE) cfg;
   virtual eth_seg_if#(RATE) vif;
   uvm_analysis_port#(eth_seg_seq_item) item_collected_port;
+  uvm_analysis_port#(bit) reset_state_port;
+  bit reset_observed, previous_reset;
   int unsigned packets_seen, aborted_packets, valid_cycles, invalid_cycles;
   int unsigned idle_segments, data_segments, bytes_seen, same_cycle_boundaries;
 
@@ -22,6 +25,7 @@ class eth_seg_tx_monitor #(int RATE = 100) extends uvm_component;
   function new(string name = "eth_seg_tx_monitor", uvm_component parent = null);
     super.new(name, parent);
     item_collected_port = new("item_collected_port", this);
+    reset_state_port = new("reset_state_port", this);
   endfunction
 
   // 连接配置并检查虚接口；agent 也可直接写入 cfg/vif 后调用该组件。
@@ -72,6 +76,13 @@ class eth_seg_tx_monitor #(int RATE = 100) extends uvm_component;
     bit ended_this_cycle;
     forever begin
       @(vif.tx_cb);
+      // 同一采样域首次同步及复位边沿通知；先清理 hub，再消费本拍数据。
+      // X 复位由接口检查负责，此处只将确定的低电平视为断言。
+      if (!reset_observed || previous_reset != (vif.tx_cb.i_tx_rst_n === 1'b0)) begin
+        reset_observed = 1;
+        previous_reset = (vif.tx_cb.i_tx_rst_n === 1'b0);
+        reset_state_port.write(previous_reset);
+      end
       if (!vif.tx_cb.i_tx_rst_n) begin
         if (in_packet) aborted_packets++;
         in_packet = 0;

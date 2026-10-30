@@ -1,5 +1,6 @@
 // src 检查层：双方向异步 expected/actual FIFO scoreboard。
-// driver 在真正 EOP 采样后发布 expected，monitor 可早于或晚于 driver 发布 actual；
+// expected 可由 driver 的 EOP 通知或用户 RM 提供；同一队列只选一个期望源。
+// 用户直接 write_before/write_after 默认比较 TX 出口，输入均深拷贝。
 // 每条 analysis_imp 都先复制事务入对应 FIFO，再按到达顺序尝试匹配，因此不依赖时间戳、
 // sequence id 或 UVM 调度顺序。check_phase 对残留 FIFO 报错，确保丢包和重复包可见。
 `uvm_analysis_imp_decl(_expect_tx)
@@ -71,19 +72,70 @@ class eth_seg_scoreboard extends uvm_component;
 
   // 接收 TX expected 并复制入 FIFO；driver 原对象之后可安全复用。
   function void write_expect_tx(eth_seg_seq_item item);
-    eth_seg_seq_item c = new("sb_exp_tx"); c.copy(item); expect_tx_fifo.push_back(c); try_match(0);
+    eth_seg_seq_item c;
+    if (item == null) begin
+      `uvm_error("ETH_SEG_SB_NULL", "scoreboard input must be a complete non-null transaction")
+      return;
+    end
+    c = new("sb_exp_tx");
+    c.copy(item);
+    expect_tx_fifo.push_back(c);
+    try_match(0);
   endfunction
   // 接收 RX expected 并复制入 FIFO。
   function void write_expect_rx(eth_seg_seq_item item);
-    eth_seg_seq_item c = new("sb_exp_rx"); c.copy(item); expect_rx_fifo.push_back(c); try_match(1);
+    eth_seg_seq_item c;
+    if (item == null) begin
+      `uvm_error("ETH_SEG_SB_NULL", "scoreboard input must be a complete non-null transaction")
+      return;
+    end
+    c = new("sb_exp_rx");
+    c.copy(item);
+    expect_rx_fifo.push_back(c);
+    try_match(1);
   endfunction
   // 接收 TX actual monitor 事务。
   function void write_actual_tx(eth_seg_seq_item item);
-    eth_seg_seq_item c = new("sb_act_tx"); c.copy(item); actual_tx_fifo.push_back(c); try_match(0);
+    eth_seg_seq_item c;
+    if (item == null) begin
+      `uvm_error("ETH_SEG_SB_NULL", "scoreboard input must be a complete non-null transaction")
+      return;
+    end
+    c = new("sb_act_tx");
+    c.copy(item);
+    actual_tx_fifo.push_back(c);
+    try_match(0);
   endfunction
   // 接收 RX actual monitor 事务。
   function void write_actual_rx(eth_seg_seq_item item);
-    eth_seg_seq_item c = new("sb_act_rx"); c.copy(item); actual_rx_fifo.push_back(c); try_match(1);
+    eth_seg_seq_item c;
+    if (item == null) begin
+      `uvm_error("ETH_SEG_SB_NULL", "scoreboard input must be a complete non-null transaction")
+      return;
+    end
+    c = new("sb_act_rx");
+    c.copy(item);
+    actual_rx_fifo.push_back(c);
+    try_match(1);
+  endfunction
+
+  // RM 直接提交期望 TX 出口整包；允许实际先到，返回不表示已经匹配。
+  function void write_before(eth_seg_seq_item item);
+    write_expect_tx(item);
+  endfunction
+
+  // 采样线程直接提交实际 TX 出口整包；复制后可安全复用调用者对象。
+  function void write_after(eth_seg_seq_item item);
+    write_actual_tx(item);
+  endfunction
+
+  // 用户明确选择复位丢弃在途事务时调用；只清指定方向，不清累计匹配/错误计数。
+  function void flush_direction(eth_seg_dir_e dir);
+    case (dir)
+      ETH_SEG_TX: begin expect_tx_fifo.delete(); actual_tx_fifo.delete(); end
+      ETH_SEG_RX: begin expect_rx_fifo.delete(); actual_rx_fifo.delete(); end
+      default: `uvm_error("ETH_SEG_SB_DIR", "flush direction must be TX or RX")
+    endcase
   endfunction
 
   // 返回四个 FIFO 都为空且没有待比对事务。

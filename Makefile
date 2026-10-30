@@ -43,6 +43,39 @@ TIMING_SRC := rtl/eth_seg_if.sv src/eth_seg_types.sv src/eth_seg_pkg.sv \
               test/timing/eth_timing_test_pkg.sv test/timing/tb_timing.sv
 SCENARIO ?= all
 
+# hub 契约测试无需 net_packet/AIP；源码与原 smoke 独立构建。
+HUB_SRC := rtl/eth_seg_if.sv src/eth_seg_types.sv src/eth_seg_pkg.sv \
+           test/sampling/eth_seg_hub_test_pkg.sv test/sampling/tb_hub.sv
+
+.PHONY: hub-test hub-run
+hub-test:
+	$(MAKE) --no-print-directory hub-run BUILD=build/sampling_hub
+
+hub-run:
+	mkdir -p $(BUILD)/logs $(BUILD)/csrc
+	$(VCS) $(VCSFLAGS) -top tb_hub $(HUB_SRC) -l $(BUILD)/logs/compile.log
+	python3 scripts/check_log.py $(BUILD)/logs/compile.log compile
+	$(SIMV) +ntb_random_seed=$(SEED) -l $(BUILD)/logs/hub.log
+	python3 scripts/check_log.py $(BUILD)/logs/hub.log run ETH_HUB_TEST_COMPLETE
+
+
+# RM/SCB 示例使用网络报文，但不依赖可选 AIP；复位控制只属于测试。
+SAMPLING_SRC := $(NET_SRC) checker/eth_seg_protocol_checker.sv \
+                test/sampling/eth_sampling_control.sv examples/sampling/eth_rm_scb_example_pkg.sv \
+                test/sampling/eth_rm_scb_test_pkg.sv test/sampling/tb_rm_scb.sv
+
+.PHONY: sampling-test sampling-run
+sampling-test:
+	$(MAKE) --no-print-directory sampling-run BUILD=build/sampling
+
+sampling-run:
+	test -n "$(NET_PACKET)" && test -f "$(NET_PACKET)/src/net_packet_pkg.sv"
+	mkdir -p $(BUILD)/logs $(BUILD)/csrc
+	$(VCS) $(VCSFLAGS) $(NET_INC) -top tb_rm_scb $(SAMPLING_SRC) -l $(BUILD)/logs/compile.log
+	python3 scripts/check_log.py $(BUILD)/logs/compile.log compile
+	$(SIMV) +ntb_random_seed=$(SEED) -l $(BUILD)/logs/sampling.log
+	python3 scripts/check_log.py $(BUILD)/logs/sampling.log run ETH_SAMPLING_TEST_COMPLETE
+
 .PHONY: compile run regress clean bind-test bind-run aip-test aip-run \
         net-packet-test net-packet-run net-packet-aip-test net-packet-aip-run timing-test timing-run \
         timing-checker-test timing-checker-run
